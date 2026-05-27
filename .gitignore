@@ -1,0 +1,23 @@
+# Secrets — never commit these
+.env
+cookies.json
+
+# Runtime state
+state.json
+watcher.log
+
+# Editor / agent dirs
+.claude/
+
+# Python / uv
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.python-version
+
+# Test fixture is a live capture from the account running the watcher;
+# ignored to avoid committing per-account data. tests/test_shop_api.py
+# builds a synthetic equivalent when the fixture is missing.
+tests/fixtures_sell_item.json
