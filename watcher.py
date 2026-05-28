@@ -11,6 +11,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+import discogs_api
 import evaluator
 import shop_api
 from notifier import EmailNotifier
@@ -182,6 +183,8 @@ def _load_config() -> dict:
         "max_siblings_per_release": _opt_int("MAX_SIBLINGS_PER_RELEASE", 1),
         "max_pages_per_run": _opt_int("MAX_PAGES_PER_RUN", 30),
         "healthcheck_url": os.getenv("HEALTHCHECK_URL", "").strip() or None,
+        "discogs_token": os.getenv("DISCOGS_TOKEN", "").strip() or None,
+        "discogs_username": os.getenv("DISCOGS_USERNAME", "").strip() or None,
     }
 
 
@@ -289,6 +292,30 @@ def _group_by_release(deals: list[dict], max_siblings: int = 1) -> list[dict]:
         grouped.append(primary)
     grouped.extend(no_release)
     return grouped
+
+
+def _annotate_discogs_wide_median(deals: list[dict], token: str, cache: dict) -> None:
+    """Mutate each deal in-place with Discogs-wide median for its media condition.
+
+    Calls /marketplace/price_suggestions per unique release_id, 1/s, cached
+    per run. Failures degrade silently — annotation is optional UI signal.
+    """
+    for d in deals:
+        rid = d.get("release_id")
+        if not rid:
+            continue
+        suggestions = discogs_api.price_suggestions(int(rid), token=token, cache=cache)
+        if not suggestions:
+            continue
+        bucket = suggestions.get(d.get("media_condition") or "")
+        if not isinstance(bucket, dict):
+            continue
+        d["discogs_wide_median_value"] = bucket.get("value")
+        d["discogs_wide_median_currency"] = bucket.get("currency")
+    release_hits = sum(1 for k, v in cache.items() if isinstance(k, int) and v)
+    release_total = sum(1 for k in cache if isinstance(k, int))
+    logger.info("Discogs-wide median: %d release(s) queried, %d hit",
+                release_total, release_hits)
 
 
 def _deal_sort_key(d: dict) -> tuple:
@@ -419,6 +446,25 @@ def main() -> None:
             cur_price = float(l.get("buyer_price") or l.get("price") or 0.0)
             just_alerted.append((l["id"], cur_price))
 
+    # ── Discogs-wide annotations + counts (opt-in via DISCOGS_TOKEN) ─────────
+    # Shared cache: throttle-sentinel covers all calls below it.
+    discogs_cache: dict = {}
+    wantlist_total = None
+    if cfg["discogs_token"]:
+        if new_deals:
+            _annotate_discogs_wide_median(new_deals, cfg["discogs_token"], discogs_cache)
+        if cfg["discogs_username"]:
+            wantlist_total = discogs_api.wantlist_size(
+                cfg["discogs_username"], token=cfg["discogs_token"], cache=discogs_cache,
+            )
+
+    scanned_releases = len(by_release)
+    logger.info(
+        "Wantlist scan: %s release(s) currently for sale%s",
+        scanned_releases,
+        f" out of {wantlist_total} on wantlist" if wantlist_total else "",
+    )
+
     # ── Group + sort + cap pending ───────────────────────────────────────────
     if cfg["group_by_release"]:
         new_deals = _group_by_release(new_deals, max_siblings=cfg["max_siblings_per_release"])
@@ -457,12 +503,13 @@ def main() -> None:
         cap = cfg["max_deals_per_email"] or len(pending)  # 0 = no cap
         to_send = pending[:cap]
         extra = len(pending) - len(to_send)
+        scan_counts = {"scanned_releases": scanned_releases, "wantlist_total": wantlist_total}
         if _dry_run:
             from notifier import _build_html, _build_text
             html_path = Path("/tmp/digest.html")
             text_path = Path("/tmp/digest.txt")
-            html_path.write_text(_build_html(to_send, now, extra, session_days_left))
-            text_path.write_text(_build_text(to_send, now, extra, session_days_left))
+            html_path.write_text(_build_html(to_send, now, extra, session_days_left, scan_counts=scan_counts))
+            text_path.write_text(_build_text(to_send, now, extra, session_days_left, scan_counts=scan_counts))
             logger.info("DRY_RUN: digest written to %s and %s (%d deal(s), %d extra)",
                         html_path, text_path, len(to_send), extra)
             flush_ok = True
@@ -473,7 +520,7 @@ def main() -> None:
                 smtp_from=cfg["smtp_from"], alert_to=cfg["alert_to"],
             )
             try:
-                notifier.send(to_send, now, extra_count=extra, session_days_left=session_days_left)
+                notifier.send(to_send, now, extra_count=extra, session_days_left=session_days_left, scan_counts=scan_counts)
                 flush_ok = True
             except Exception as exc:
                 logger.error("Email send failed: %s — %d deal(s) remain pending", exc, len(pending))

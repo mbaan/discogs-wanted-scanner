@@ -64,7 +64,23 @@ and at what price; re-alerts fire when a price has since dropped a further
 | `MAX_EMAILS_PER_DAY` | `4` | Safety brake against runaway alerting. |
 | `SELLER_RATING_MIN` | (unset) | Only show listings from sellers with ≥ this rating. |
 | `MAX_PAGES_PER_RUN` | `30` | Pagination cap on `/sell_item`. |
+| `DISCOGS_TOKEN` | (unset) | Optional PAT. When set, each deal is annotated with the Discogs-wide median asking price for its condition (one extra API call per deal-candidate release, paced 1/s, well under the 60/min PAT limit). Requires Discogs seller settings on the account — see below. |
 | `HEALTHCHECK_URL` | (unset) | Optional ping on each successful run (e.g. healthchecks.io). |
+
+## Optional: Discogs-wide price annotation
+
+For scarce releases the wantlist marketplace pool can be tiny (often n=2),
+which makes the "X% below median" claim hard to trust. With `DISCOGS_TOKEN`
+set, each deal is annotated in the digest with the Discogs-wide median
+asking price for that condition (one extra API call per deal-candidate
+release, cached per run, paced 1/s, well under the 60/min PAT limit).
+
+The endpoint Discogs exposes for this (`/marketplace/price_suggestions/`)
+requires **seller settings** on the token's account — currency + shipping
+policy, configured at https://www.discogs.com/settings/seller. The account
+does not have to list anything for sale, but the seller profile must
+exist. That's a personal-info step; if you'd rather not, leave
+`DISCOGS_TOKEN` unset and the watcher runs exactly as before without it.
 
 ## Layout
 

@@ -47,6 +47,7 @@ class EmailNotifier(Notifier):
         run_time: datetime,
         extra_count: int = 0,
         session_days_left: int | None = None,
+        scan_counts: dict | None = None,
     ) -> None:
         if not deals:
             return
@@ -58,8 +59,8 @@ class EmailNotifier(Notifier):
         msg["Subject"] = subject
         msg["From"] = self.smtp_from
         msg["To"] = self.alert_to
-        msg.attach(MIMEText(_build_text(deals, run_time, extra_count, session_days_left), "plain"))
-        msg.attach(MIMEText(_build_html(deals, run_time, extra_count, session_days_left), "html"))
+        msg.attach(MIMEText(_build_text(deals, run_time, extra_count, session_days_left, scan_counts=scan_counts), "plain"))
+        msg.attach(MIMEText(_build_html(deals, run_time, extra_count, session_days_left, scan_counts=scan_counts), "html"))
 
         self._send_message(msg)
         logger.info("Email sent to %s (%d deal(s), %d extra)", self.alert_to, n, extra_count)
@@ -140,9 +141,20 @@ def _price_line(deal: dict) -> str:
         f"{_money(landed_amt, landed_ccy)} landed "
         f"({_money(item, item_ccy)} + {_money(ship, landed_ccy)} ship)",
         deal.get("deal_reason", ""),
+        _discogs_wide_snippet(deal),
         deal.get("certainty_label", ""),
     ]
     return " · ".join(p for p in parts if p)
+
+
+def _discogs_wide_snippet(deal: dict) -> str:
+    """`Discogs-wide NM ≈ €X.XX` — empty when no annotation present."""
+    value = deal.get("discogs_wide_median_value")
+    if value is None:
+        return ""
+    cond = condition_short(deal.get("media_condition"))
+    ccy = deal.get("discogs_wide_median_currency") or deal.get("landed_currency")
+    return f"Discogs-wide {cond} ≈ {_money(value, ccy)}"
 
 
 def _seller_line(deal: dict) -> str:
@@ -198,6 +210,13 @@ def _deal_html(deal: dict) -> str:
     else:
         price_line_html = _h(price_line_raw)
 
+    if deal.get("is_deal_remote"):
+        price_line_html += (
+            ' <span style="background:#fff3c4; color:#7a5b00; padding:1px 6px; '
+            'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
+            'border:1px solid #f0d678;">★ Discogs Deal</span>'
+        )
+
     comments = (deal.get("comments") or "").strip()
     comments_html = (
         f'<div style="margin-top:4px; font-size:12px; color:#666; font-style:italic;">'
@@ -238,9 +257,23 @@ def _session_note(days: int | None) -> tuple[str, str]:
     return (f"cookie {days}d valid", "#4caf50")
 
 
+def _scan_summary(scan_counts: dict | None) -> str:
+    """`50 of 1800 wantlist releases for sale` — empty if counts unavailable."""
+    if not scan_counts:
+        return ""
+    scanned = scan_counts.get("scanned_releases")
+    total = scan_counts.get("wantlist_total")
+    if not scanned:
+        return ""
+    if total:
+        return f"{scanned} of {total} wantlist releases for sale"
+    return f"{scanned} wantlist release(s) for sale"
+
+
 def _build_html(
     deals: list[dict], run_time: datetime, extra_count: int,
     session_days_left: int | None = None,
+    scan_counts: dict | None = None,
 ) -> str:
     run_str = run_time.strftime("%Y-%m-%d %H:%M UTC")
     rows = "".join(_deal_html(d) for d in deals)
@@ -252,6 +285,11 @@ def _build_html(
         f'border-radius:10px; font-size:11px; margin-left:8px; '
         f'border:1px solid {session_color};">{session_label}</span>'
         if session_label else ""
+    )
+    scan_summary = _scan_summary(scan_counts)
+    scan_html = (
+        f'<p style="margin:2px 0 0; color:#888; font-size:12px;">{_h(scan_summary)}</p>'
+        if scan_summary else ""
     )
     extra = ""
     if extra_count > 0:
@@ -271,6 +309,7 @@ def _build_html(
       <p style="margin:6px 0 0; color:#bbb; font-size:13px;">
         {n} good deal{s} on your wantlist · {run_str}{session_html}
       </p>
+      {scan_html}
     </div>
     <div style="padding:8px 24px 20px;">
       <table style="width:100%; border-collapse:collapse;">{rows}</table>
@@ -287,17 +326,25 @@ def _build_html(
 def _build_text(
     deals: list[dict], run_time: datetime, extra_count: int,
     session_days_left: int | None = None,
+    scan_counts: dict | None = None,
 ) -> str:
     run_str = run_time.strftime("%Y-%m-%d %H:%M UTC")
     session_label, _ = _session_note(session_days_left)
     header = f"Discogs Watcher · {len(deals)} good deal(s) · {run_str}"
     if session_label:
         header += f" · {session_label}"
-    lines = [header, "=" * 60]
+    scan_summary = _scan_summary(scan_counts)
+    lines = [header]
+    if scan_summary:
+        lines.append(scan_summary)
+    lines.append("=" * 60)
     for d in deals:
         lines.append("")
         lines.append(_heading(d))
-        lines.append(_price_line(d))
+        line = _price_line(d)
+        if d.get("is_deal_remote"):
+            line += " · ★ Discogs Deal"
+        lines.append(line)
         lines.append(_seller_line(d))
         if d.get("comments"):
             lines.append(f'"{d["comments"]}"')
