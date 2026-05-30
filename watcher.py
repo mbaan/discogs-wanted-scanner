@@ -156,17 +156,15 @@ def _opt_bool(key: str, default: bool) -> bool:
 
 def _load_config() -> dict:
     load_dotenv(_ENV_FILE)
-    min_cert = os.getenv("MIN_CERTAINTY", "MEDIUM").strip().upper()
-    if min_cert not in ("HIGH", "MEDIUM", "LOW"):
-        logger.warning("Invalid MIN_CERTAINTY=%r, using MEDIUM", min_cert)
-        min_cert = "MEDIUM"
     digest_mode = os.getenv("DIGEST_MODE", "hourly").strip().lower()
     if digest_mode not in ("hourly", "daily"):
         logger.warning("Invalid DIGEST_MODE=%r, using hourly", digest_mode)
         digest_mode = "hourly"
     return {
         "my_country": os.getenv("MY_COUNTRY", "Netherlands").strip(),
-        "deal_threshold": _opt_float("DEAL_THRESHOLD", 0.25),
+        "deal_threshold": _opt_float("DEAL_THRESHOLD", 0.35),
+        "vat_rate": _opt_float("VAT_RATE", 0.21),
+        "big_deal_threshold": _opt_float("BIG_DEAL_THRESHOLD", 0.50),
         "price_drop_threshold": _opt_float("PRICE_DROP_THRESHOLD", 0.05),
         "seller_rating_min": _opt_int("SELLER_RATING_MIN", None),
         "smtp_host": _smtp("SMTP_HOST"),
@@ -175,7 +173,6 @@ def _load_config() -> dict:
         "smtp_pass": _smtp("SMTP_PASS"),
         "smtp_from": _smtp("SMTP_FROM"),
         "alert_to": _smtp("ALERT_TO"),
-        "min_certainty": min_cert,
         "digest_mode": digest_mode,
         "digest_hour_utc": _opt_int("DIGEST_HOUR_UTC", 7),
         "max_deals_per_email": _opt_int("MAX_DEALS_PER_EMAIL", 0),  # 0 = no cap, show all
@@ -245,30 +242,34 @@ def _maybe_send_admin_alert(state, cfg, now, key, subject, body):
 
 # ── Per-listing evaluation ───────────────────────────────────────────────────
 
-_CERTAINTY_RANK = {"HIGH": 2, "MEDIUM": 1, "LOW": 0}
-
-
 def _evaluate_release_group(group: list[dict], cfg: dict) -> list[dict]:
-    """Evaluate one release's qualifying-condition listings, filter by certainty."""
-    deals = evaluator.evaluate_release_group(
+    """Evaluate one release's qualifying-condition listings.
+
+    The effective-discount threshold inside the evaluator is the only gate;
+    everything it returns is a deal.
+    """
+    return evaluator.evaluate_release_group(
         group,
         deal_threshold=cfg["deal_threshold"],
         my_country=cfg["my_country"],
+        vat_rate=cfg["vat_rate"],
+        big_deal_threshold=cfg["big_deal_threshold"],
     )
-    return [
-        d for d in deals
-        if evaluator.certainty_passes_min(d["certainty_label"], cfg["min_certainty"])
-    ]
 
 
 # ── Grouping ─────────────────────────────────────────────────────────────────
 
+def _by_discount_depth(d: dict) -> tuple:
+    """Deepest effective discount first; unranked (solo/flagged) listings last."""
+    return (0 if d.get("ranked") else 1, -(d.get("effective_discount") or 0.0))
+
+
 def _group_by_release(deals: list[dict], max_siblings: int = 1) -> list[dict]:
     """
     Collapse multiple deals for the same release into one primary entry plus
-    up to `max_siblings` runner-ups. Primary = lowest landed price (what
-    actually matters for the buyer). With max_siblings=1, each release
-    contributes at most 2 visible listings.
+    up to `max_siblings` runner-ups. Primary = deepest effective discount (the
+    best deal, which also drives the digest sort order). With max_siblings=1,
+    each release contributes at most 2 visible listings.
     """
     by_release: dict[int, list[dict]] = {}
     no_release: list[dict] = []
@@ -281,7 +282,7 @@ def _group_by_release(deals: list[dict], max_siblings: int = 1) -> list[dict]:
 
     grouped: list[dict] = []
     for rid, group in by_release.items():
-        group.sort(key=lambda d: d.get("landed_price", 1e9))
+        group.sort(key=_by_discount_depth)
         primary = dict(group[0])
         primary["_siblings"] = [
             {
@@ -356,11 +357,14 @@ def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
 
 
 def _deal_sort_key(d: dict) -> tuple:
-    """Alphabetical by artist then title — reads naturally in the digest."""
+    """Deepest effective discount first; unranked (solo/flagged) deals sink to
+    the bottom. Artist/title is a stable tie-break so equal-discount deals read
+    naturally."""
     return (
+        0 if d.get("ranked") else 1,
+        -(d.get("effective_discount") or 0.0),
         (d.get("release_artist") or "").lower(),
         (d.get("release_title") or "").lower(),
-        (d.get("release_year") or 0),
     )
 
 
@@ -475,8 +479,9 @@ def main() -> None:
             new_deals.append(d)
             just_alerted.append((lid, cur_price))
             logger.info(
-                "Deal[%s/%s]: %s — %s | %s%.2f landed | %s",
-                d["certainty_label"], d["deal_source"],
+                "Deal[%s%s]: %s — %s | %s%.2f landed | %s",
+                f"{d['discount_pct']}%" if d.get("discount_pct") is not None else d["deal_source"],
+                " ★50%+" if d.get("big_deal") else "",
                 d.get("release_artist") or "?", d.get("release_title") or "?",
                 evaluator.currency_symbol(d["landed_currency"]), d["landed_price"],
                 d["deal_reason"],

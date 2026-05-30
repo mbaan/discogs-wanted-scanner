@@ -37,7 +37,7 @@ Run `DEBUG=1 python watcher.py` on first use to see raw response keys and verify
 watcher.py        — orchestration entrypoint; run this
 shop_api.py       — internal shop-page-api client (session cookie auth)
 discogs_api.py    — official API (PAT auth, in-run cached)
-evaluator.py      — VG+/VG+ filter, deal eval, certainty signal, shipping region
+evaluator.py      — VG+/VG+ filter, effective-discount deal eval (incl. VAT), shipping region
 notifier.py       — EmailNotifier (HTML digest) + Notifier base class
 ```
 
@@ -48,10 +48,14 @@ First run looks back 1 hour; no flood of old listings.
 
 - **Country:** Netherlands — domestic/EU/international shipping is flagged
 - **Min condition:** VG+ or better for both media AND sleeve (hard requirement)
-- **Deal threshold:** 30% below condition median (configurable via `DEAL_THRESHOLD` in .env)
+- **Deal model:** single axis — *effective discount* below the per-condition median, where
+  effective cost = landed (item + shipping) + estimated import VAT for non-EU origins. A listing
+  is a deal at `DEAL_THRESHOLD` (default 35%); deals are ranked deepest-first; ≥`BIG_DEAL_THRESHOLD`
+  (default 50%) earns a 🔥 badge. VAT estimate via `VAT_RATE` (default 0.21, non-EU only).
+  Solo/Discogs-flagged listings have no computed discount and sort last. (No more HIGH/MEDIUM/LOW
+  certainty — removed.)
 - **Seller rating:** 90+ minimum (configurable via `SELLER_RATING_MIN`)
 - **Email:** ProtonMail Bridge (headless on Pi) — `smtp_host=127.0.0.1 smtp_port=1025`
-- **Certainty signal:** HIGH/MEDIUM/LOW based on num_for_sale + discount depth
 
 ## Setup on a new machine
 

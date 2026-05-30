@@ -7,54 +7,49 @@ from pathlib import Path
 import watcher
 
 
-def _deal(id_, release_id, price, certainty="HIGH", currency="EUR"):
+def _deal(id_, release_id, price, discount_pct=40, currency="EUR", ranked=True):
     return {
         "id": id_, "release_id": release_id,
         "release_artist": "X", "release_title": f"R{release_id}",
         "buyer_price": price, "buyer_currency": currency,
         "shipping_buyer_price": 5.0,
         "landed_price": price + 5.0, "landed_currency": currency,
-        "certainty_label": certainty, "deal_source": "remote_flag",
-        "discount_pct": 40, "listing_url": f"https://x/{id_}",
+        "deal_source": "below_condition_median" if ranked else "remote_only",
+        "discount_pct": discount_pct if ranked else None,
+        "effective_discount": (discount_pct / 100.0) if ranked else None,
+        "ranked": ranked, "big_deal": ranked and discount_pct >= 50,
+        "listing_url": f"https://x/{id_}",
         "seller_username": f"seller{id_}",
     }
 
 
-def test_group_by_release_picks_cheapest_landed_with_cap():
-    """Primary = lowest landed price (what matters to the buyer), even if
-    another listing has a higher discount %. Siblings capped at max_siblings."""
+def test_group_by_release_picks_deepest_discount_with_cap():
+    """Primary = deepest effective discount (the best deal), even if a shallower
+    deal is cheaper in absolute terms. Siblings capped at max_siblings."""
     deals = [
-        _deal(1, 100, 20.0, "HIGH"),    # landed_price 25.0
-        _deal(2, 100, 15.0, "MEDIUM"),  # landed_price 20.0 ← cheapest
-        _deal(3, 100, 30.0, "LOW"),     # landed_price 35.0
-        _deal(4, 200, 9.0, "HIGH"),     # landed_price 14.0 — solo for release 200
+        _deal(1, 100, 20.0, discount_pct=30),
+        _deal(2, 100, 15.0, discount_pct=40),   # cheapest, but not the deepest deal
+        _deal(3, 100, 30.0, discount_pct=55),    # deepest discount → primary
+        _deal(4, 200, 9.0, discount_pct=50),     # solo for release 200
     ]
-    # Set discount % such that id 3 has the HIGHEST discount — to confirm
-    # landed wins over discount % in the sort.
-    deals[0]["discount_pct"] = 30
-    deals[1]["discount_pct"] = 40
-    deals[2]["discount_pct"] = 99   # would win on discount %, but it's the most expensive
-    deals[3]["discount_pct"] = 50
-
     grouped = watcher._group_by_release(deals, max_siblings=1)
     by_rel = {g["release_id"]: g for g in grouped}
-    # Release 100: cheapest landed = #2 → primary. Next cheapest = #1 → sibling.
-    assert by_rel[100]["id"] == 2
-    assert [s["seller_username"] for s in by_rel[100]["_siblings"]] == ["seller1"]
-    # The high-discount but expensive #3 should NOT be primary or sibling.
+    # Release 100: deepest discount = #3 → primary; next deepest = #2 → sibling.
+    assert by_rel[100]["id"] == 3
+    assert [s["seller_username"] for s in by_rel[100]["_siblings"]] == ["seller2"]
+    # The cheap-but-shallow #1 is dropped beyond the sibling cap.
     assert by_rel[200]["id"] == 4
     assert by_rel[200]["_siblings"] == []
 
 
 def test_group_by_release_max_siblings_zero_drops_alternatives():
     deals = [
-        _deal(1, 100, 20.0, "HIGH"),
-        _deal(2, 100, 15.0, "MEDIUM"),
+        _deal(1, 100, 20.0, discount_pct=30),
+        _deal(2, 100, 15.0, discount_pct=60),
     ]
-    deals[0]["discount_pct"] = 30
-    deals[1]["discount_pct"] = 60
     grouped = watcher._group_by_release(deals, max_siblings=0)
     assert len(grouped) == 1
+    assert grouped[0]["id"] == 2       # deepest discount wins
     assert grouped[0]["_siblings"] == []
 
 
@@ -104,10 +99,17 @@ def test_prune_keeps_highest_ids_under_cap():
     assert min(pruned) >= 60_000 - watcher._ALERTED_HARD_CAP
 
 
-def test_deal_sort_key_alphabetical_by_artist_then_title():
-    a = _deal(1, 1, 10.0, "MEDIUM"); a["release_artist"] = "Zoe Keating"; a["release_title"] = "Into the Trees"
-    b = _deal(2, 2, 10.0, "HIGH");   b["release_artist"] = "Aphex Twin";  b["release_title"] = "Selected Ambient Works"
-    c = _deal(3, 3, 10.0, "HIGH");   c["release_artist"] = "Aphex Twin";  c["release_title"] = "Drukqs"
+def test_deal_sort_key_deepest_discount_first_unranked_last():
+    a = _deal(1, 1, 10.0, discount_pct=40)
+    b = _deal(2, 2, 10.0, discount_pct=55)   # deepest → first
+    c = _deal(3, 3, 10.0, ranked=False)      # solo/flagged, no discount → last
     ordered = sorted([a, b, c], key=watcher._deal_sort_key)
-    # Aphex Twin (Drukqs, then Selected Ambient Works), then Zoe Keating
-    assert [d["id"] for d in ordered] == [3, 2, 1]
+    assert [d["id"] for d in ordered] == [2, 1, 3]
+
+
+def test_deal_sort_key_alphabetical_tie_break():
+    a = _deal(1, 1, 10.0, discount_pct=40); a["release_artist"] = "Zoe Keating"
+    b = _deal(2, 2, 10.0, discount_pct=40); b["release_artist"] = "Aphex Twin"
+    ordered = sorted([a, b], key=watcher._deal_sort_key)
+    # Equal discount → alphabetical by artist.
+    assert [d["id"] for d in ordered] == [2, 1]

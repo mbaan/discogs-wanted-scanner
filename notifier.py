@@ -19,12 +19,6 @@ from evaluator import condition_short, currency_symbol
 
 logger = logging.getLogger(__name__)
 
-_CERTAINTY_COLOURS = {
-    "HIGH": "#2e7d32",
-    "MEDIUM": "#e65100",
-    "LOW": "#b71c1c",
-}
-
 
 class Notifier(ABC):
     @abstractmethod
@@ -137,12 +131,16 @@ def _price_line(deal: dict) -> str:
     ship = deal.get("shipping_buyer_price") or deal.get("shipping_price") or 0
     landed_amt = deal.get("landed_price")
     landed_ccy = deal.get("landed_currency") or item_ccy
-    parts = [
+    cost = (
         f"{_money(landed_amt, landed_ccy)} landed "
-        f"({_money(item, item_ccy)} + {_money(ship, landed_ccy)} ship)",
+        f"({_money(item, item_ccy)} + {_money(ship, landed_ccy)} ship)"
+    )
+    if deal.get("vat_estimated") and deal.get("vat_amount"):
+        cost += f" + ~{_money(deal.get('vat_amount'), landed_ccy)} est. import VAT"
+    parts = [
+        cost,
         deal.get("deal_reason", ""),
         _discogs_wide_snippet(deal),
-        deal.get("certainty_label", ""),
     ]
     return " · ".join(p for p in parts if p)
 
@@ -270,8 +268,6 @@ def _shipping_text(deal: dict) -> list[str]:
 
 
 def _deal_html(deal: dict) -> str:
-    cert = deal.get("certainty_label", "")
-    cert_color = _CERTAINTY_COLOURS.get(cert, "#555")
     img = deal.get("image_url")
     img_html = (
         f'<img src="{_h(img)}" alt="" width="64" height="64" '
@@ -279,15 +275,14 @@ def _deal_html(deal: dict) -> str:
         if img else ""
     )
 
-    # Highlight just the certainty word inside the price line
-    price_line_raw = _price_line(deal)
-    if cert and price_line_raw.endswith(" · " + cert):
-        price_line_html = (
-            _h(price_line_raw[: -(len(cert))])
-            + f'<strong style="color:{cert_color};">{_h(cert)}</strong>'
+    price_line_html = _h(_price_line(deal))
+
+    if deal.get("big_deal"):
+        price_line_html += (
+            ' <span style="background:#ffe0e0; color:#b71c1c; padding:1px 6px; '
+            'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
+            'border:1px solid #f0b0b0;">🔥 50%+</span>'
         )
-    else:
-        price_line_html = _h(price_line_raw)
 
     if deal.get("is_deal_remote"):
         price_line_html += (
@@ -396,8 +391,9 @@ def _build_html(
       <table style="width:100%; border-collapse:collapse;">{rows}</table>
       {extra}
       <p style="color:#aaa; font-size:11px; margin-top:14px; border-top:1px solid #eee; padding-top:10px;">
-        Landed = item + shipping, in your account currency.
-        Median is computed per condition (M / NM / VG+) within this release's wantlist marketplace pool.
+        Landed = item + shipping, in your account currency. Discount is vs the per-condition
+        (M / NM / VG+) median of this release's wantlist pool, measured on effective cost —
+        landed plus an estimated import VAT uplift for non-EU origins. Deals are sorted deepest-first.
       </p>
     </div>
   </div>
@@ -423,6 +419,8 @@ def _build_text(
         lines.append("")
         lines.append(_heading(d))
         line = _price_line(d)
+        if d.get("big_deal"):
+            line += " · 🔥 50%+"
         if d.get("is_deal_remote"):
             line += " · ★ Discogs Deal"
         lines.append(line)

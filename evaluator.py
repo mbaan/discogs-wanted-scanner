@@ -1,15 +1,20 @@
 """
 Per-release, per-condition deal evaluation.
 
-For each release, listings are bucketed by media_condition and a median
-landed price is computed within each bucket. A listing is a deal when its
-landed price is at least DEAL_THRESHOLD below its bucket's median. Solo
-listings (n=1 in a bucket) emit only if Discogs' own `isDeal` flag fires.
+For each release, listings are bucketed by media_condition. Within a bucket we
+compute each listing's *effective cost* — the true cost to the buyer: landed
+price (item + shipping) plus estimated import VAT for non-EU origins — and take
+the median over those. A listing is a deal when its effective discount
+(1 - effective_cost / median) is at least DEAL_THRESHOLD. Deals are ranked
+deepest-first; anything at or above BIG_DEAL_THRESHOLD earns a `big_deal` flag.
 
-Certainty:
-  HIGH   — discount ≥ 40%, or Discogs `isDeal` flag also fires
-  MEDIUM — discount in [threshold, 40%) with ≥ 5 comparable listings
-  LOW    — above threshold but thin comps, or solo-listing fallback
+Solo listings (n=1 in a bucket, no peer to compare against) have no computed
+discount; they emit only if Discogs' own `isDeal` flag fires, and are marked
+`ranked=False` so they sort below all discount-ranked deals.
+
+VAT is estimated by region (see `vat_applies`): EU/domestic prices already
+include VAT, so only non-EU imports are uplifted. The same uplift is applied to
+every listing in the bucket, keeping the median comparison apples-to-apples.
 """
 
 import logging
@@ -56,8 +61,6 @@ _CONDITION_SHORT = {
 def condition_short(c: str | None) -> str:
     return _CONDITION_SHORT.get(c or "", c or "?")
 
-_CERTAINTY_RANK = {"LOW": 0, "MEDIUM": 1, "HIGH": 2}
-
 
 def currency_symbol(code: str | None) -> str:
     return {"EUR": "€", "USD": "$", "GBP": "£", "JPY": "¥"}.get(code or "", (code or "") + " ")
@@ -68,16 +71,33 @@ def passes_condition(media: str | None, sleeve: str | None) -> bool:
     return (media in PASSING_CONDITIONS) and (sleeve in PASSING_CONDITIONS)
 
 
-def certainty_passes_min(label: str, min_label: str) -> bool:
-    return _CERTAINTY_RANK.get(label, -1) >= _CERTAINTY_RANK.get(min_label, 0)
-
-
 def landed_price(listing: dict) -> tuple[float, str]:
     """Total cost to the buyer = item + shipping, in the buyer's currency."""
     item = listing.get("buyer_price") or listing.get("price") or 0.0
     ship = listing.get("shipping_buyer_price") or listing.get("shipping_price") or 0.0
     ccy = listing.get("buyer_currency") or listing.get("currency") or "EUR"
     return float(item) + float(ship), ccy
+
+
+def vat_applies(ships_from: str | None, my_country: str) -> bool:
+    """True for non-EU imports, where the buyer owes import VAT on arrival.
+
+    EU/domestic prices already include VAT; an unknown origin is treated as no
+    VAT (don't penalise a deal on a guess).
+    """
+    sf = (ships_from or "").strip()
+    if not sf:
+        return False
+    return sf != my_country.strip() and sf not in EU_COUNTRIES
+
+
+def effective_cost(
+    landed: float, ships_from: str | None, my_country: str, vat_rate: float
+) -> float:
+    """Landed price uplifted by estimated import VAT when shipped from outside the EU."""
+    if vat_rate and vat_applies(ships_from, my_country):
+        return landed * (1.0 + vat_rate)
+    return landed
 
 
 def price_drop_pct(listing: dict) -> float:
@@ -114,6 +134,8 @@ def evaluate_release_group(
     listings: list[dict],
     deal_threshold: float,
     my_country: str,
+    vat_rate: float = 0.21,
+    big_deal_threshold: float = 0.50,
 ) -> list[dict]:
     """Bucket by media_condition, then evaluate each bucket independently."""
     if not listings:
@@ -127,9 +149,9 @@ def evaluate_release_group(
 
     deals: list[dict] = []
     for cond, bucket in buckets.items():
-        deals.extend(
-            _evaluate_condition_bucket(cond, bucket, deal_threshold, my_country)
-        )
+        deals.extend(_evaluate_condition_bucket(
+            cond, bucket, deal_threshold, my_country, vat_rate, big_deal_threshold,
+        ))
     return deals
 
 
@@ -138,92 +160,77 @@ def _evaluate_condition_bucket(
     bucket: list[dict],
     deal_threshold: float,
     my_country: str,
+    vat_rate: float,
+    big_deal_threshold: float,
 ) -> list[dict]:
-    enriched = [(landed_price(l), l) for l in bucket]
-    enriched.sort(key=lambda t: t[0][0])
+    # (landed, ccy, effective_cost, listing), cheapest effective cost first
+    # (which is also the deepest discount first).
+    enriched = []
+    for l in bucket:
+        landed, ccy = landed_price(l)
+        eff = effective_cost(landed, l.get("ships_from"), my_country, vat_rate)
+        enriched.append((landed, ccy, eff, l))
+    enriched.sort(key=lambda t: t[2])
     n = len(enriched)
     cond_short = condition_short(condition)
 
     if n == 1:
-        only = enriched[0][1]
-        landed, ccy = enriched[0][0]
+        landed, ccy, eff, only = enriched[0]
         if not only.get("is_deal_remote"):
             return []
         return [_verdict(
-            only, landed, ccy,
-            is_deal=True, discount_pct=0,
+            only, landed, ccy, eff,
+            discount_pct=None, effective_discount=None, ranked=False, big_deal=False,
             reason=f"Discogs flagged · only {cond_short} listing on the marketplace",
             source="remote_only",
-            certainty="LOW",
-            detail=f"No peer {cond_short} listings to compare against",
             median_value=None, median_currency=None,
-            my_country=my_country,
+            my_country=my_country, vat_rate=vat_rate,
         )]
 
-    landed_values = [e[0][0] for e in enriched]
-    bucket_median = _median(landed_values)
-    sym = currency_symbol(enriched[0][0][1])
+    bucket_median = _median([e[2] for e in enriched])
+    sym = currency_symbol(enriched[0][1])
     out: list[dict] = []
-    for (landed, ccy), listing in enriched:
-        if landed >= bucket_median * (1.0 - deal_threshold):
+    for landed, ccy, eff, listing in enriched:
+        if eff >= bucket_median * (1.0 - deal_threshold):
             continue
-        discount = 1.0 - (landed / bucket_median)
+        discount = 1.0 - (eff / bucket_median)
         pct = int(discount * 100)
-        is_deal_remote = bool(listing.get("is_deal_remote"))
-        certainty = _certainty(discount, n, is_deal_remote)
-        # n=2: median equals one of the two prices, so degrade unless Discogs concurs
-        if n == 2 and not is_deal_remote:
-            certainty = "LOW"
         out.append(_verdict(
-            listing, landed, ccy,
-            is_deal=True, discount_pct=pct,
+            listing, landed, ccy, eff,
+            discount_pct=pct, effective_discount=discount, ranked=True,
+            big_deal=discount >= big_deal_threshold,
             reason=f"{pct}% below {cond_short} median {sym}{bucket_median:.2f} of {n}",
             source="below_condition_median",
-            certainty=certainty,
-            detail=_certainty_detail(discount, n, is_deal_remote),
             median_value=bucket_median, median_currency=ccy,
-            my_country=my_country,
+            my_country=my_country, vat_rate=vat_rate,
         ))
     return out
 
 
-def _certainty(discount: float, comps: int, is_deal_remote: bool) -> str:
-    if is_deal_remote or discount >= 0.40:
-        return "HIGH"
-    if comps >= 5:
-        return "MEDIUM"
-    return "LOW"
-
-
-def _certainty_detail(discount: float, comps: int, is_deal_remote: bool) -> str:
-    pct = int(discount * 100)
-    parts = [f"{pct}% below median"]
-    if comps:
-        parts.append(f"{comps} comps for sale")
-    if is_deal_remote:
-        parts.append("Discogs flagged as deal")
-    return ", ".join(parts)
-
-
 def _verdict(
-    listing: dict, landed: float, ccy: str,
-    *, is_deal: bool, discount_pct: int, reason: str, source: str,
-    certainty: str, detail: str,
+    listing: dict, landed: float, ccy: str, eff: float,
+    *, discount_pct: int | None, effective_discount: float | None,
+    ranked: bool, big_deal: bool, reason: str, source: str,
     median_value: float | None, median_currency: str | None,
-    my_country: str,
+    my_country: str, vat_rate: float,
 ) -> dict:
+    vat_estimated = bool(vat_rate) and vat_applies(listing.get("ships_from"), my_country)
     return {
         **listing,
         "deal_reason": reason,
         "deal_source": source,
         "discount_pct": discount_pct,
-        "is_deal": is_deal,
-        "certainty_label": certainty,
-        "certainty_detail": detail,
+        "effective_discount": effective_discount,
+        "ranked": ranked,
+        "big_deal": big_deal,
+        "is_deal": True,
         "median_value": median_value,
         "median_currency": median_currency,
         "landed_price": landed,
         "landed_currency": ccy,
+        "effective_cost": eff,
+        "vat_amount": round(eff - landed, 2),
+        "vat_estimated": vat_estimated,
         "shipping_region": get_shipping_region(listing.get("ships_from"), my_country),
     }
 

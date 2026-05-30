@@ -1,4 +1,6 @@
 """Per-release, per-condition deal evaluation."""
+import pytest
+
 import evaluator
 
 
@@ -62,7 +64,10 @@ def test_solo_listing_with_remote_flag_emits():
     )
     assert len(deals) == 1
     assert deals[0]["deal_source"] == "remote_only"
-    assert deals[0]["certainty_label"] == "LOW"
+    # No peer to compare against → unranked, no computed discount, sorts last.
+    assert deals[0]["ranked"] is False
+    assert deals[0]["discount_pct"] is None
+    assert deals[0]["big_deal"] is False
 
 
 def test_deal_when_cheapest_is_outlier_within_condition():
@@ -138,36 +143,6 @@ def test_per_condition_separately_emits_deals():
     assert set(by_id) == {1, 4}
 
 
-def test_two_listing_bucket_downgrades_certainty_to_low():
-    """n=2 in a bucket means the median IS one of the two prices — thin signal."""
-    listings = [
-        _listing(1, buyer_price=20.0, shipping_buyer_price=5.0,
-                 media_condition="Very Good Plus (VG+)"),
-        _listing(2, buyer_price=50.0, shipping_buyer_price=5.0,
-                 media_condition="Very Good Plus (VG+)"),
-    ]
-    deals = evaluator.evaluate_release_group(
-        listings, deal_threshold=0.25, my_country="Netherlands",
-    )
-    # median = (25 + 55) / 2 = 40; landed 25 < 40*0.75 = 30 → deal, but n=2 → LOW
-    assert len(deals) == 1 and deals[0]["certainty_label"] == "LOW"
-
-
-def test_two_listing_bucket_with_remote_flag_keeps_certainty():
-    """If Discogs flags the deal AND n=2 fires, don't degrade certainty."""
-    listings = [
-        _listing(1, buyer_price=20.0, shipping_buyer_price=5.0,
-                 media_condition="Very Good Plus (VG+)", is_deal_remote=True),
-        _listing(2, buyer_price=50.0, shipping_buyer_price=5.0,
-                 media_condition="Very Good Plus (VG+)"),
-    ]
-    deals = evaluator.evaluate_release_group(
-        listings, deal_threshold=0.25, my_country="Netherlands",
-    )
-    # is_deal_remote=True triggers HIGH in _certainty, not floored to LOW
-    assert len(deals) == 1 and deals[0]["certainty_label"] == "HIGH"
-
-
 def test_no_deals_when_prices_clustered_in_bucket():
     listings = [
         _listing(1, buyer_price=20.0, shipping_buyer_price=5.0),
@@ -199,33 +174,78 @@ def test_high_shipping_does_not_get_filtered_but_loses_on_landed():
     assert [d["id"] for d in deals] == [1]
 
 
-# ── Certainty ────────────────────────────────────────────────────────────────
+# ── Effective-discount gate + big_deal flag ──────────────────────────────────
 
-def test_certainty_high_for_deep_discount():
+def test_gate_just_below_35pct_qualifies():
+    # median 100; landed 64 → 36% effective discount → deal (default 0.35)
     listings = [
-        _listing(1, buyer_price=10.0, shipping_buyer_price=2.0),  # 12 landed
-        _listing(2, buyer_price=30.0, shipping_buyer_price=5.0),  # 35
-        _listing(3, buyer_price=33.0, shipping_buyer_price=5.0),  # 38
+        _listing(1, buyer_price=59.0, shipping_buyer_price=5.0),   # 64
+        _listing(2, buyer_price=95.0, shipping_buyer_price=5.0),   # 100
+        _listing(3, buyer_price=95.0, shipping_buyer_price=5.0),   # 100
+    ]
+    deals = evaluator.evaluate_release_group(listings, deal_threshold=0.35, my_country="Netherlands")
+    assert [d["id"] for d in deals] == [1] and deals[0]["discount_pct"] == 36
+
+
+def test_gate_just_above_35pct_rejected():
+    # median 100; landed 66 → 34% effective discount → no deal
+    listings = [
+        _listing(1, buyer_price=61.0, shipping_buyer_price=5.0),   # 66
+        _listing(2, buyer_price=95.0, shipping_buyer_price=5.0),   # 100
+        _listing(3, buyer_price=95.0, shipping_buyer_price=5.0),   # 100
+    ]
+    deals = evaluator.evaluate_release_group(listings, deal_threshold=0.35, my_country="Netherlands")
+    assert deals == []
+
+
+def test_big_deal_flag_fires_at_threshold():
+    listings = [
+        _listing(1, buyer_price=15.0, shipping_buyer_price=5.0),   # 20 landed
+        _listing(2, buyer_price=45.0, shipping_buyer_price=5.0),   # 50
+        _listing(3, buyer_price=45.0, shipping_buyer_price=5.0),   # 50
     ]
     deals = evaluator.evaluate_release_group(
-        listings, deal_threshold=0.25, my_country="Netherlands",
+        listings, deal_threshold=0.35, my_country="Netherlands", big_deal_threshold=0.50,
     )
-    # median = 35; landed 12 → 66% discount → HIGH
-    assert deals[0]["certainty_label"] == "HIGH"
+    # median 50; landed 20 → 60% → big_deal
+    assert deals[0]["discount_pct"] == 60 and deals[0]["big_deal"] is True
 
 
-def test_certainty_medium_with_decent_comps():
+# ── VAT estimate ─────────────────────────────────────────────────────────────
+
+def test_vat_applies_truth_table():
+    assert evaluator.vat_applies("Netherlands", "Netherlands") is False  # domestic
+    assert evaluator.vat_applies("Belgium", "Netherlands") is False      # EU
+    assert evaluator.vat_applies("United States", "Netherlands") is True  # non-EU
+    assert evaluator.vat_applies("United Kingdom", "Netherlands") is True  # non-EU post-Brexit
+    assert evaluator.vat_applies(None, "Netherlands") is False           # unknown → no VAT
+
+
+def test_effective_cost_uplifts_non_eu():
+    assert evaluator.effective_cost(100.0, "United States", "Netherlands", 0.21) == pytest.approx(121.0)
+    assert evaluator.effective_cost(100.0, "Belgium", "Netherlands", 0.21) == 100.0
+    assert evaluator.effective_cost(100.0, "United States", "Netherlands", 0.0) == 100.0
+
+
+def test_vat_penalises_import_in_ranking():
+    """Two equally-cheap copies (EU vs US): VAT makes the US one a shallower deal."""
     listings = [
-        _listing(1, buyer_price=20.0, shipping_buyer_price=5.0),  # 25
-        _listing(2, buyer_price=30.0, shipping_buyer_price=5.0),  # 35
-        _listing(3, buyer_price=33.0, shipping_buyer_price=5.0),  # 38
-        _listing(4, buyer_price=35.0, shipping_buyer_price=5.0),  # 40
-        _listing(5, buyer_price=36.0, shipping_buyer_price=5.0),  # 41
+        _listing(1, buyer_price=15.0, shipping_buyer_price=5.0, ships_from="Belgium"),       # eff 20
+        _listing(2, buyer_price=15.0, shipping_buyer_price=5.0, ships_from="United States"),  # eff 24.2
+        _listing(3, buyer_price=55.0, shipping_buyer_price=5.0, ships_from="Belgium"),        # eff 60
+        _listing(4, buyer_price=59.0, shipping_buyer_price=5.0, ships_from="Belgium"),        # eff 64
     ]
     deals = evaluator.evaluate_release_group(
-        listings, deal_threshold=0.25, my_country="Netherlands",
+        listings, deal_threshold=0.35, my_country="Netherlands",
+        vat_rate=0.21, big_deal_threshold=0.50,
     )
-    assert deals[0]["certainty_label"] == "MEDIUM"
+    by_id = {d["id"]: d for d in deals}
+    # Bucket effective median = (24.2 + 60)/2 = 42.1; both 1 and 2 qualify.
+    assert by_id[1]["effective_discount"] > by_id[2]["effective_discount"]
+    assert by_id[1]["big_deal"] is True            # 52% off
+    assert by_id[2]["big_deal"] is False           # 42% off after VAT
+    assert by_id[2]["vat_estimated"] is True and by_id[2]["vat_amount"] == 4.2
+    assert by_id[1]["vat_estimated"] is False
 
 
 # ── Shipping region ─────────────────────────────────────────────────────────
@@ -235,9 +255,3 @@ def test_shipping_region_classification():
     assert "EU" in evaluator.get_shipping_region("Belgium", "Netherlands")
     assert "International" in evaluator.get_shipping_region("United States", "Netherlands")
     assert "Unknown" in evaluator.get_shipping_region(None, "Netherlands")
-
-
-def test_certainty_min_filter():
-    assert evaluator.certainty_passes_min("HIGH", "MEDIUM")
-    assert evaluator.certainty_passes_min("MEDIUM", "MEDIUM")
-    assert not evaluator.certainty_passes_min("LOW", "MEDIUM")
