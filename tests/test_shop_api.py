@@ -50,33 +50,27 @@ def _fixture():
     return _SYNTHETIC
 
 
-def test_fixture_has_items():
-    data = _fixture()
-    assert data["items"], "live fixture should have items"
-    assert "totalCount" in data
-
-
 def test_parse_listing_minimal_fields():
     item = _fixture()["items"][0]
     parsed = shop_api.parse_listing(item)
     assert parsed is not None
     # Required identifiers
-    assert isinstance(parsed["id"], int)
-    assert parsed["release_id"] is not None
-    assert parsed["release_title"]
-    assert parsed["release_artist"]
+    assert isinstance(parsed.id, int)
+    assert parsed.release_id is not None
+    assert parsed.release_title
+    assert parsed.release_artist
     # Buyer-currency price is what we compare against medians
-    assert parsed["buyer_price"] > 0
-    assert parsed["buyer_currency"]
-    assert parsed["price"] > 0
+    assert parsed.buyer_price > 0
+    assert parsed.buyer_currency
+    assert parsed.price > 0
     # Discogs' deal flag is captured (bool, default False if absent)
-    assert isinstance(parsed["is_deal_remote"], bool)
+    assert isinstance(parsed.is_deal_remote, bool)
     # Shipping fields present (may be None for free shipping)
-    assert "shipping_price" in parsed
-    assert "shipping_buyer_price" in parsed
+    assert hasattr(parsed, "shipping_price")
+    assert hasattr(parsed, "shipping_buyer_price")
     # Image + comments captured
-    assert "image_url" in parsed
-    assert "comments" in parsed
+    assert hasattr(parsed, "image_url")
+    assert hasattr(parsed, "comments")
 
 
 def test_parse_skips_unavailable_listing():

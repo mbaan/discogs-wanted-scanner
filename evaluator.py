@@ -19,6 +19,8 @@ every listing in the bucket, keeping the median comparison apples-to-apples.
 
 import logging
 
+from models import Deal, Listing
+
 logger = logging.getLogger(__name__)
 
 PASSING_CONDITIONS = frozenset({
@@ -71,11 +73,11 @@ def passes_condition(media: str | None, sleeve: str | None) -> bool:
     return (media in PASSING_CONDITIONS) and (sleeve in PASSING_CONDITIONS)
 
 
-def landed_price(listing: dict) -> tuple[float, str]:
+def landed_price(listing: Listing) -> tuple[float, str]:
     """Total cost to the buyer = item + shipping, in the buyer's currency."""
-    item = listing.get("buyer_price") or listing.get("price") or 0.0
-    ship = listing.get("shipping_buyer_price") or listing.get("shipping_price") or 0.0
-    ccy = listing.get("buyer_currency") or listing.get("currency") or "EUR"
+    item = listing.buyer_price or listing.price or 0.0
+    ship = listing.shipping_buyer_price or listing.shipping_price or 0.0
+    ccy = listing.buyer_currency or listing.currency or "EUR"
     return float(item) + float(ship), ccy
 
 
@@ -100,27 +102,6 @@ def effective_cost(
     return landed
 
 
-def price_drop_pct(listing: dict) -> float:
-    """
-    How much did the *buyer-currency* price drop vs the seller's previous price?
-    Returns 0.0 when there's no drop or no previous-price data.
-    """
-    cur = listing.get("buyer_price") or listing.get("price")
-    prev = listing.get("previous_buyer_price") or listing.get("previous_price")
-    if not cur or not prev or prev <= cur:
-        return 0.0
-    return 1.0 - (cur / prev)
-
-
-def _own_median(price_suggestions: dict | None, condition: str) -> tuple[float | None, str | None]:
-    if not price_suggestions:
-        return None, None
-    obj = price_suggestions.get(condition)
-    if not isinstance(obj, dict):
-        return None, None
-    return obj.get("value"), obj.get("currency")
-
-
 def _median(values: list[float]) -> float:
     s = sorted(values)
     n = len(s)
@@ -131,23 +112,23 @@ def _median(values: list[float]) -> float:
 
 
 def evaluate_release_group(
-    listings: list[dict],
+    listings: list[Listing],
     deal_threshold: float,
     my_country: str,
     vat_rate: float = 0.21,
     big_deal_threshold: float = 0.50,
-) -> list[dict]:
+) -> list[Deal]:
     """Bucket by media_condition, then evaluate each bucket independently."""
     if not listings:
         return []
 
     # Partition by media condition.
-    buckets: dict[str, list[dict]] = {}
+    buckets: dict[str, list[Listing]] = {}
     for l in listings:
-        cond = l.get("media_condition") or ""
+        cond = l.media_condition or ""
         buckets.setdefault(cond, []).append(l)
 
-    deals: list[dict] = []
+    deals: list[Deal] = []
     for cond, bucket in buckets.items():
         deals.extend(_evaluate_condition_bucket(
             cond, bucket, deal_threshold, my_country, vat_rate, big_deal_threshold,
@@ -157,18 +138,18 @@ def evaluate_release_group(
 
 def _evaluate_condition_bucket(
     condition: str,
-    bucket: list[dict],
+    bucket: list[Listing],
     deal_threshold: float,
     my_country: str,
     vat_rate: float,
     big_deal_threshold: float,
-) -> list[dict]:
+) -> list[Deal]:
     # (landed, ccy, effective_cost, listing), cheapest effective cost first
     # (which is also the deepest discount first).
     enriched = []
     for l in bucket:
         landed, ccy = landed_price(l)
-        eff = effective_cost(landed, l.get("ships_from"), my_country, vat_rate)
+        eff = effective_cost(landed, l.ships_from, my_country, vat_rate)
         enriched.append((landed, ccy, eff, l))
     enriched.sort(key=lambda t: t[2])
     n = len(enriched)
@@ -176,7 +157,7 @@ def _evaluate_condition_bucket(
 
     if n == 1:
         landed, ccy, eff, only = enriched[0]
-        if not only.get("is_deal_remote"):
+        if not only.is_deal_remote:
             return []
         return [_verdict(
             only, landed, ccy, eff,
@@ -189,7 +170,7 @@ def _evaluate_condition_bucket(
 
     bucket_median = _median([e[2] for e in enriched])
     sym = currency_symbol(enriched[0][1])
-    out: list[dict] = []
+    out: list[Deal] = []
     for landed, ccy, eff, listing in enriched:
         if eff >= bucket_median * (1.0 - deal_threshold):
             continue
@@ -208,31 +189,30 @@ def _evaluate_condition_bucket(
 
 
 def _verdict(
-    listing: dict, landed: float, ccy: str, eff: float,
+    listing: Listing, landed: float, ccy: str, eff: float,
     *, discount_pct: int | None, effective_discount: float | None,
     ranked: bool, big_deal: bool, reason: str, source: str,
     median_value: float | None, median_currency: str | None,
     my_country: str, vat_rate: float,
-) -> dict:
-    vat_estimated = bool(vat_rate) and vat_applies(listing.get("ships_from"), my_country)
-    return {
-        **listing,
-        "deal_reason": reason,
-        "deal_source": source,
-        "discount_pct": discount_pct,
-        "effective_discount": effective_discount,
-        "ranked": ranked,
-        "big_deal": big_deal,
-        "is_deal": True,
-        "median_value": median_value,
-        "median_currency": median_currency,
-        "landed_price": landed,
-        "landed_currency": ccy,
-        "effective_cost": eff,
-        "vat_amount": round(eff - landed, 2),
-        "vat_estimated": vat_estimated,
-        "shipping_region": get_shipping_region(listing.get("ships_from"), my_country),
-    }
+) -> Deal:
+    vat_estimated = bool(vat_rate) and vat_applies(listing.ships_from, my_country)
+    return Deal.from_listing(
+        listing,
+        deal_reason=reason,
+        deal_source=source,
+        discount_pct=discount_pct,
+        effective_discount=effective_discount,
+        ranked=ranked,
+        big_deal=big_deal,
+        median_value=median_value,
+        median_currency=median_currency,
+        landed_price=landed,
+        landed_currency=ccy,
+        effective_cost=eff,
+        vat_amount=round(eff - landed, 2),
+        vat_estimated=vat_estimated,
+        shipping_region=get_shipping_region(listing.ships_from, my_country),
+    )
 
 
 def get_shipping_region(ships_from: str | None, my_country: str) -> str:
@@ -246,7 +226,7 @@ def get_shipping_region(ships_from: str | None, my_country: str) -> str:
     return f"International ({sf})"
 
 
-def group_by_seller(listings: list[dict], passing_only: bool = True) -> dict[int, list[dict]]:
+def group_by_seller(listings: list[Listing], passing_only: bool = True) -> dict[int, list[Listing]]:
     """Group fetched wantlist listings by seller uid.
 
     Every /sell_item listing is already a wantlist match, so this yields, per
@@ -254,32 +234,32 @@ def group_by_seller(listings: list[dict], passing_only: bool = True) -> dict[int
     "combine to save shipping" picks. When `passing_only`, keep only listings
     meeting the configured min condition (same gate as the rest of the digest).
     """
-    out: dict[int, list[dict]] = {}
+    out: dict[int, list[Listing]] = {}
     for l in listings:
-        uid = l.get("seller_uid")
+        uid = l.seller_uid
         if uid is None:
             continue
-        if passing_only and not passes_condition(l.get("media_condition"), l.get("sleeve_condition")):
+        if passing_only and not passes_condition(l.media_condition, l.sleeve_condition):
             continue
         out.setdefault(int(uid), []).append(l)
     return out
 
 
-def seller_picks(seller_listings: list[dict], exclude_id: int, limit: int) -> tuple[list[dict], int]:
+def seller_picks(seller_listings: list[Listing], exclude_id: int, limit: int) -> tuple[list[dict], int]:
     """Cheapest-first compact picks for the email, excluding the deal itself.
 
     Returns (picks_capped_at_limit, total_other_items).
     """
-    others = [l for l in seller_listings if l.get("id") != exclude_id]
-    others.sort(key=lambda l: float(l.get("buyer_price") or l.get("price") or 0.0))
+    others = [l for l in seller_listings if l.id != exclude_id]
+    others.sort(key=lambda l: float(l.buyer_price or l.price or 0.0))
     picks = []
     for l in others[:limit]:
         picks.append({
-            "release_artist": l.get("release_artist"),
-            "release_title": l.get("release_title"),
-            "media_condition": l.get("media_condition"),
-            "buyer_price": l.get("buyer_price") or l.get("price"),
-            "buyer_currency": l.get("buyer_currency") or l.get("currency"),
-            "listing_url": l.get("listing_url"),
+            "release_artist": l.release_artist,
+            "release_title": l.release_title,
+            "media_condition": l.media_condition,
+            "buyer_price": l.buyer_price or l.price,
+            "buyer_currency": l.buyer_currency or l.currency,
+            "listing_url": l.listing_url,
         })
     return picks, len(others)

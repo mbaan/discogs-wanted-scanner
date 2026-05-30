@@ -151,10 +151,12 @@ in clients that block remote images.
 ## Layout
 
 ```
-watcher.py        entry point + orchestration
+watcher.py        entry point: fetch → core → network annotations → email → state
+core.py           pure deal pipeline: filter → evaluate → group → sort → all-time-low
+models.py         Listing + Deal dataclasses — the typed data surface
+evaluator.py      condition filter, effective-cost median, VAT, shipping region
 shop_api.py       internal /sell_item client + cookie session auth
 discogs_api.py    official PAT API (price suggestions, wantlist size)
-evaluator.py      condition filter, effective-cost median, VAT, shipping region
 shipping_policy.py  v3 shipping-policy fetch + landed-room estimate
 notifier.py       EmailNotifier — HTML + plain-text digest, admin alerts
 tests/            pytest, no network

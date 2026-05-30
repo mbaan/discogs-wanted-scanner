@@ -11,10 +11,12 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
+import core
 import discogs_api
 import evaluator
 import shipping_policy
 import shop_api
+from models import Deal
 from notifier import EmailNotifier
 
 # ── Paths ────────────────────────────────────────────────────────────────────
@@ -70,25 +72,11 @@ def _save_state(state: dict) -> None:
     os.replace(tmp, _STATE_FILE)
 
 
-def _migrate_alerted(state: dict) -> dict[int, float]:
-    """
-    state['alerted'] schema: {str(id): last_alert_price_in_buyer_currency}.
-    Migrates from older dict-shaped 'seen' if present.
-    """
+def _load_alerted(state: dict) -> dict[int, float]:
+    """state['alerted'] schema: {str(id): last_alert_price_in_buyer_currency}."""
     raw = state.get("alerted")
     if isinstance(raw, dict):
         return {int(k): float(v) for k, v in raw.items() if v is not None}
-    if isinstance(raw, list):
-        return {int(x): 0.0 for x in raw}
-    seen = state.get("seen")  # tolerate older state file shape
-    if isinstance(seen, dict):
-        out = {}
-        for k, v in seen.items():
-            if isinstance(v, dict):
-                out[int(k)] = float(v.get("price") or 0.0)
-            else:
-                out[int(k)] = 0.0
-        return out
     return {}
 
 
@@ -242,84 +230,26 @@ def _maybe_send_admin_alert(state, cfg, now, key, subject, body):
         logger.error("Admin alert send failed (%s): %s", subject, exc)
 
 
-# ── Per-listing evaluation ───────────────────────────────────────────────────
+# ── Network annotations (opt-in via DISCOGS_TOKEN) ───────────────────────────
 
-def _evaluate_release_group(group: list[dict], cfg: dict) -> list[dict]:
-    """Evaluate one release's qualifying-condition listings.
-
-    The effective-discount threshold inside the evaluator is the only gate;
-    everything it returns is a deal.
-    """
-    return evaluator.evaluate_release_group(
-        group,
-        deal_threshold=cfg["deal_threshold"],
-        my_country=cfg["my_country"],
-        vat_rate=cfg["vat_rate"],
-        big_deal_threshold=cfg["big_deal_threshold"],
-    )
-
-
-# ── Grouping ─────────────────────────────────────────────────────────────────
-
-def _by_discount_depth(d: dict) -> tuple:
-    """Deepest effective discount first; unranked (solo/flagged) listings last."""
-    return (0 if d.get("ranked") else 1, -(d.get("effective_discount") or 0.0))
-
-
-def _group_by_release(deals: list[dict], max_siblings: int = 1) -> list[dict]:
-    """
-    Collapse multiple deals for the same release into one primary entry plus
-    up to `max_siblings` runner-ups. Primary = deepest effective discount (the
-    best deal, which also drives the digest sort order). With max_siblings=1,
-    each release contributes at most 2 visible listings.
-    """
-    by_release: dict[int, list[dict]] = {}
-    no_release: list[dict] = []
-    for d in deals:
-        rid = d.get("release_id")
-        if rid:
-            by_release.setdefault(int(rid), []).append(d)
-        else:
-            no_release.append(d)
-
-    grouped: list[dict] = []
-    for rid, group in by_release.items():
-        group.sort(key=_by_discount_depth)
-        primary = dict(group[0])
-        primary["_siblings"] = [
-            {
-                "landed_price": s.get("landed_price"),
-                "landed_currency": s.get("landed_currency"),
-                "listing_url": s.get("listing_url"),
-                "seller_username": s.get("seller_username"),
-                "media_condition": s.get("media_condition"),
-                "discount_pct": s.get("discount_pct"),
-            }
-            for s in group[1:1 + max_siblings]
-        ]
-        grouped.append(primary)
-    grouped.extend(no_release)
-    return grouped
-
-
-def _annotate_discogs_wide_median(deals: list[dict], token: str, cache: dict) -> None:
+def _annotate_discogs_wide_median(deals: list[Deal], token: str, cache: dict) -> None:
     """Mutate each deal in-place with Discogs-wide median for its media condition.
 
     Calls /marketplace/price_suggestions per unique release_id, 1/s, cached
     per run. Failures degrade silently — annotation is optional UI signal.
     """
     for d in deals:
-        rid = d.get("release_id")
+        rid = d.release_id
         if not rid:
             continue
         suggestions = discogs_api.price_suggestions(int(rid), token=token, cache=cache)
         if not suggestions:
             continue
-        bucket = suggestions.get(d.get("media_condition") or "")
+        bucket = suggestions.get(d.media_condition or "")
         if not isinstance(bucket, dict):
             continue
-        d["discogs_wide_median_value"] = bucket.get("value")
-        d["discogs_wide_median_currency"] = bucket.get("currency")
+        d.discogs_wide_median_value = bucket.get("value")
+        d.discogs_wide_median_currency = bucket.get("currency")
     release_hits = sum(1 for k, v in cache.items() if isinstance(k, int) and v)
     release_total = sum(1 for k in cache if isinstance(k, int))
     logger.info("Discogs-wide median: %d release(s) queried, %d hit",
@@ -334,15 +264,15 @@ def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
     """
     token, country = cfg["discogs_token"], cfg["my_country"]
     for d in deals:
-        uid = d.get("seller_uid")
+        uid = d.seller_uid
         if uid is None:
             continue
         listings = seller_groups.get(int(uid), [])
         if not listings:
             continue
-        picks, total_others = evaluator.seller_picks(listings, d.get("id"), cfg["max_seller_picks"])
-        d["_seller_picks"] = picks
-        d["_seller_total_others"] = total_others
+        picks, total_others = evaluator.seller_picks(listings, d.id, cfg["max_seller_picks"])
+        d.seller_picks = picks
+        d.seller_total_others = total_others
 
         policy = shipping_policy.get_policy(
             uid, country, token=token, run_cache=run_cache,
@@ -350,94 +280,15 @@ def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
         )
         if policy is None:
             continue
-        subtotal = sum(float(l.get("price") or 0.0) for l in listings)
+        subtotal = sum(float(l.price or 0.0) for l in listings)
         hint = shipping_policy.estimate_room(policy, len(listings), subtotal, cfg["est_grams_per_vinyl"])
-        hint["seller"] = d.get("seller_username")
+        hint["seller"] = d.seller_username
         hint["country"] = country
         hint["total_others"] = total_others
-        d["shipping_hint"] = hint
-
-
-# ── Historical price floor ───────────────────────────────────────────────────
-# We persist the lowest landed price we've *observed* per (release, condition)
-# in state.json, one entry per day, pruned to a rolling window. When a new deal
-# beats every prior observed low — and we have enough observations to mean it —
-# it earns an "all-time low" badge in the digest.
-
-def _record_price_history(price_history: dict, qualifying_listings: list[dict], now: datetime) -> None:
-    """Record the lowest landed price seen today per (release_id, media_condition)."""
-    today = now.date().isoformat()
-    for listing in qualifying_listings:
-        rid = listing.get("release_id")
-        cond = listing.get("media_condition")
-        if rid is None or not cond:
-            continue
-        key = f"{rid}:{cond}"
-        landed, ccy = evaluator.landed_price(listing)
-        landed = round(landed, 2)
-        entries = price_history.setdefault(key, [])
-        for entry in entries:
-            if entry["d"] == today:
-                if landed < entry["p"]:
-                    entry["p"] = landed
-                    entry["c"] = ccy
-                break
-        else:
-            entries.append({"d": today, "p": landed, "c": ccy})
-
-
-def _prune_price_history(price_history: dict, now: datetime, days: int) -> None:
-    """Drop entries older than `days` and remove keys left empty."""
-    cutoff = (now - timedelta(days=days)).date().isoformat()
-    for key in list(price_history):
-        kept = [e for e in price_history[key] if e["d"] >= cutoff]
-        if kept:
-            price_history[key] = kept
-        else:
-            del price_history[key]
-
-
-def _annotate_historical_floor(deals: list[dict], price_history: dict, min_points: int) -> None:
-    """Mutate deals in-place: badge any whose landed price beats every prior
-    observed low for its (release, condition), once we have >= min_points
-    observations. Call this BEFORE recording today's prices, so a deal isn't
-    compared against its own freshly-recorded entry."""
-    for deal in deals:
-        rid = deal.get("release_id")
-        cond = deal.get("media_condition")
-        if rid is None or not cond:
-            continue
-        history = price_history.get(f"{rid}:{cond}") or []
-        if len(history) < min_points:
-            continue
-        floor = min(e["p"] for e in history)
-        landed = deal.get("landed_price")
-        if landed is not None and landed < floor:
-            deal["historical_floor_value"] = floor
-            deal["historical_floor_pct"] = int((1.0 - landed / floor) * 100)
-            deal["historical_data_points"] = len(history)
-
-
-def _deal_sort_key(d: dict) -> tuple:
-    """Deepest effective discount first; unranked (solo/flagged) deals sink to
-    the bottom. Artist/title is a stable tie-break so equal-discount deals read
-    naturally."""
-    return (
-        0 if d.get("ranked") else 1,
-        -(d.get("effective_discount") or 0.0),
-        (d.get("release_artist") or "").lower(),
-        (d.get("release_title") or "").lower(),
-    )
+        d.shipping_hint = hint
 
 
 # ── Pending / digest helpers ─────────────────────────────────────────────────
-
-_STRIPPED_BEFORE_PENDING = {"listed_at"}
-
-
-def _strip_for_pending(deal: dict) -> dict:
-    return {k: v for k, v in deal.items() if k not in _STRIPPED_BEFORE_PENDING}
-
 
 def _emails_today(state: dict, now: datetime) -> int:
     daily = state.get("emails_today") or {}
@@ -462,8 +313,8 @@ def main() -> None:
 
     _check_session_health(state, cfg, now)
 
-    alerted = _migrate_alerted(state)
-    pending: list[dict] = state.get("pending_deals") or []
+    alerted = _load_alerted(state)
+    pending: list[Deal] = [Deal.from_pending(d) for d in (state.get("pending_deals") or [])]
     policy_cache: dict = state.get("shipping_policies") or {}
     price_history: dict = state.get("price_history") or {}
 
@@ -505,57 +356,14 @@ def main() -> None:
         len(listings), "complete" if fetch_result.complete else "incomplete",
     )
 
-    # ── Group by release, filter to qualifying conditions ────────────────────
-    by_release: dict[int, list[dict]] = {}
-    skipped_condition = 0
-    skipped_no_release = 0
-    for l in listings:
-        if not evaluator.passes_condition(l.get("media_condition"), l.get("sleeve_condition")):
-            skipped_condition += 1
-            continue
-        rid = l.get("release_id")
-        if rid is None:
-            skipped_no_release += 1
-            continue
-        by_release.setdefault(int(rid), []).append(l)
-    logger.info(
-        "Grouped into %d release(s); skipped %d for condition, %d missing release_id",
-        len(by_release), skipped_condition, skipped_no_release,
-    )
+    # ── Build deals (pure pipeline: filter → evaluate → group → sort) ────────
+    result = core.build_deals(listings, alerted, price_history, cfg, now)
+    new_deals = result.deals
+    just_alerted = result.just_alerted
+    seller_groups = result.seller_groups
+    scanned_releases = result.scanned_releases
 
-    # Per-seller view of qualifying wantlist listings — basis for shipping hints.
-    seller_groups = evaluator.group_by_seller(listings, passing_only=True)
-
-    # ── Evaluate each release group ──────────────────────────────────────────
-    new_deals: list[dict] = []
-    just_alerted: list[tuple[int, float]] = []  # (id, buyer_price)
-
-    for release_id, group in by_release.items():
-        deals = _evaluate_release_group(group, cfg)
-
-        for d in deals:
-            lid = d["id"]
-            cur_price = float(d.get("buyer_price") or d.get("price") or 0.0)
-            prev_alert = alerted.get(lid)
-            if prev_alert is not None and prev_alert > 0 and cur_price >= prev_alert * (1 - cfg["price_drop_threshold"]):
-                continue  # already alerted at near this price
-            new_deals.append(d)
-            just_alerted.append((lid, cur_price))
-            logger.info(
-                "Deal[%s%s]: %s — %s | %s%.2f landed | %s",
-                f"{d['discount_pct']}%" if d.get("discount_pct") is not None else d["deal_source"],
-                " ★50%+" if d.get("big_deal") else "",
-                d.get("release_artist") or "?", d.get("release_title") or "?",
-                evaluator.currency_symbol(d["landed_currency"]), d["landed_price"],
-                d["deal_reason"],
-            )
-
-        # Record price for every listing so re-alerts only fire on drops
-        for l in group:
-            cur_price = float(l.get("buyer_price") or l.get("price") or 0.0)
-            just_alerted.append((l["id"], cur_price))
-
-    # ── Discogs-wide annotations + counts (opt-in via DISCOGS_TOKEN) ─────────
+    # ── Network annotations + counts (opt-in via DISCOGS_TOKEN) ──────────────
     # Shared cache: throttle-sentinel covers all calls below it.
     discogs_cache: dict = {}
     wantlist_total = None
@@ -567,28 +375,16 @@ def main() -> None:
                 cfg["discogs_username"], token=cfg["discogs_token"], cache=discogs_cache,
             )
 
-    scanned_releases = len(by_release)
     logger.info(
         "Wantlist scan: %s release(s) currently for sale%s",
         scanned_releases,
         f" out of {wantlist_total} on wantlist" if wantlist_total else "",
     )
 
-    # ── Group + sort + cap pending ───────────────────────────────────────────
-    if cfg["group_by_release"]:
-        new_deals = _group_by_release(new_deals, max_siblings=cfg["max_siblings_per_release"])
-    new_deals.sort(key=_deal_sort_key)
-
-    # Annotate against prior observations, THEN fold today's prices into history.
-    _annotate_historical_floor(new_deals, price_history, cfg["price_history_min_points"])
-    qualifying_listings = [l for group in by_release.values() for l in group]
-    _record_price_history(price_history, qualifying_listings, now)
-
     if cfg["shipping_hints"] and cfg["discogs_token"]:
         _annotate_shipping(new_deals, seller_groups, cfg, discogs_cache, policy_cache)
 
-    for d in new_deals:
-        pending.append(_strip_for_pending(d))
+    pending.extend(new_deals)
 
     if len(pending) > _PENDING_HARD_CAP:
         dropped = len(pending) - _PENDING_HARD_CAP
@@ -596,10 +392,7 @@ def main() -> None:
         logger.warning("Pending exceeded cap; dropped %d oldest", dropped)
 
     # ── Decide whether to flush ──────────────────────────────────────────────
-    if cfg["digest_mode"] == "daily":
-        should_flush = (now.hour == cfg["digest_hour_utc"]) and bool(pending)
-    else:
-        should_flush = bool(pending)
+    should_flush = core.should_flush(len(pending), cfg["digest_mode"], now, cfg["digest_hour_utc"])
 
     sent_today = _emails_today(state, now)
     if should_flush and sent_today >= cfg["max_emails_per_day"]:
@@ -663,9 +456,9 @@ def main() -> None:
             except Exception as exc:
                 logger.debug("Healthcheck ping failed: %s", exc)
 
-    _prune_price_history(price_history, now, cfg["price_history_days"])
+    core.prune_price_history(price_history, now, cfg["price_history_days"])
     state["alerted"] = {str(k): v for k, v in _prune_alerted(alerted).items()}
-    state["pending_deals"] = pending
+    state["pending_deals"] = [d.to_pending() for d in pending]
     state["shipping_policies"] = policy_cache
     state["price_history"] = price_history
     state["last_run"] = now.isoformat()

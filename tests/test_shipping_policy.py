@@ -7,6 +7,7 @@ import pytest
 import evaluator
 import notifier
 import shipping_policy as sp
+from models import Deal, Listing
 
 
 # Real-shaped v3 payload (mirrors api.discogs.com/v3/marketplace/shipping/policies)
@@ -127,10 +128,10 @@ def test_estimate_room_tolerates_json_roundtrip_lists():
 # ── grouping helpers ─────────────────────────────────────────────────────────
 
 def _listing(lid, uid, price, media="Very Good Plus (VG+)", sleeve="Very Good Plus (VG+)"):
-    return {"id": lid, "seller_uid": uid, "buyer_price": price, "price": price,
-            "buyer_currency": "EUR", "media_condition": media, "sleeve_condition": sleeve,
-            "release_artist": f"A{lid}", "release_title": f"T{lid}",
-            "listing_url": f"https://www.discogs.com/sell/item/{lid}"}
+    return Listing(id=lid, seller_uid=uid, buyer_price=price, price=price,
+                   buyer_currency="EUR", media_condition=media, sleeve_condition=sleeve,
+                   release_artist=f"A{lid}", release_title=f"T{lid}",
+                   listing_url=f"https://www.discogs.com/sell/item/{lid}")
 
 
 def test_group_by_seller_filters_condition():
@@ -141,7 +142,7 @@ def test_group_by_seller_filters_condition():
     ]
     groups = evaluator.group_by_seller(listings, passing_only=True)
     assert sorted(groups.keys()) == [100, 200]
-    assert [l["id"] for l in groups[100]] == [1]
+    assert [l.id for l in groups[100]] == [1]
 
 
 def test_seller_picks_excludes_deal_sorts_and_caps():
@@ -165,19 +166,19 @@ def test_shipping_summary_weight():
 
 
 def test_shipping_block_renders_in_digest_without_crashing():
-    deal = {
-        "id": 1, "release_title": "X", "media_condition": "Mint (M)",
-        "seller_username": "vinyldigital.de", "listing_url": "u",
-        "_seller_total_others": 3,
-        "_seller_picks": [
+    deal = Deal(
+        id=1, release_title="X", media_condition="Mint (M)",
+        seller_username="vinyldigital.de", listing_url="u",
+        seller_total_others=3,
+        seller_picks=[
             {"release_artist": "B", "release_title": "Y", "media_condition": "Mint (M)",
              "buyer_price": 9.0, "buyer_currency": "EUR", "listing_url": "u2"},
         ],
-        "shipping_hint": {"currency": "EUR", "country": "Netherlands", "free_shipping": False,
-                          "tiers": [(999, 9.8), (1999, 11.8), (0, 47.6)], "per_item": 250,
-                          "basis": "weight-est", "fee_now": 9.8, "room_more": 1, "next_fee": 11.8,
-                          "seller": "vinyldigital.de", "n_items": 2, "subtotal": 18.0},
-    }
+        shipping_hint={"currency": "EUR", "country": "Netherlands", "free_shipping": False,
+                       "tiers": [(999, 9.8), (1999, 11.8), (0, 47.6)], "per_item": 250,
+                       "basis": "weight-est", "fee_now": 9.8, "room_more": 1, "next_fee": 11.8,
+                       "seller": "vinyldigital.de", "n_items": 2, "subtotal": 18.0},
+    )
     now = dt.datetime(2026, 5, 30, 12, 0, tzinfo=dt.timezone.utc)
     html = notifier._build_html([deal], now, 0)
     text = notifier._build_text([deal], now, 0)

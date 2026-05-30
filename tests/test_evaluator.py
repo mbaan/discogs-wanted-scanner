@@ -2,19 +2,20 @@
 import pytest
 
 import evaluator
+from models import Listing
 
 
 def _listing(id_, **kw):
-    base = {
-        "id": id_, "release_id": 100, "release_title": "Test", "release_artist": "Artist",
-        "media_condition": "Very Good Plus (VG+)", "sleeve_condition": "Very Good Plus (VG+)",
-        "price": 20.0, "currency": "EUR",
-        "buyer_price": 20.0, "buyer_currency": "EUR",
-        "shipping_price": 5.0, "shipping_buyer_price": 5.0,
-        "is_deal_remote": False, "ships_from": "Belgium",
-    }
+    base = dict(
+        id=id_, release_id=100, release_title="Test", release_artist="Artist",
+        media_condition="Very Good Plus (VG+)", sleeve_condition="Very Good Plus (VG+)",
+        price=20.0, currency="EUR",
+        buyer_price=20.0, buyer_currency="EUR",
+        shipping_price=5.0, shipping_buyer_price=5.0,
+        is_deal_remote=False, ships_from="Belgium",
+    )
     base.update(kw)
-    return base
+    return Listing(**base)
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -63,11 +64,11 @@ def test_solo_listing_with_remote_flag_emits():
         deal_threshold=0.25, my_country="Netherlands",
     )
     assert len(deals) == 1
-    assert deals[0]["deal_source"] == "remote_only"
+    assert deals[0].deal_source == "remote_only"
     # No peer to compare against → unranked, no computed discount, sorts last.
-    assert deals[0]["ranked"] is False
-    assert deals[0]["discount_pct"] is None
-    assert deals[0]["big_deal"] is False
+    assert deals[0].ranked is False
+    assert deals[0].discount_pct is None
+    assert deals[0].big_deal is False
 
 
 def test_deal_when_cheapest_is_outlier_within_condition():
@@ -80,10 +81,10 @@ def test_deal_when_cheapest_is_outlier_within_condition():
     deals = evaluator.evaluate_release_group(
         listings, deal_threshold=0.25, my_country="Netherlands",
     )
-    assert len(deals) == 1 and deals[0]["id"] == 1
-    assert deals[0]["deal_source"] == "below_condition_median"
-    assert "VG+ median" in deals[0]["deal_reason"]
-    assert "of 3" in deals[0]["deal_reason"]
+    assert len(deals) == 1 and deals[0].id == 1
+    assert deals[0].deal_source == "below_condition_median"
+    assert "VG+ median" in deals[0].deal_reason
+    assert "of 3" in deals[0].deal_reason
 
 
 def test_cross_condition_does_not_create_spurious_deals():
@@ -136,9 +137,9 @@ def test_per_condition_separately_emits_deals():
     deals = evaluator.evaluate_release_group(
         listings, deal_threshold=0.25, my_country="Netherlands",
     )
-    by_id = {d["id"]: d for d in deals}
-    assert 1 in by_id and "VG+ median" in by_id[1]["deal_reason"]
-    assert 4 in by_id and "M median" in by_id[4]["deal_reason"]
+    by_id = {d.id: d for d in deals}
+    assert 1 in by_id and "VG+ median" in by_id[1].deal_reason
+    assert 4 in by_id and "M median" in by_id[4].deal_reason
     # And these are the ONLY deals — listings 2, 3, 5, 6 are not outliers in their buckets
     assert set(by_id) == {1, 4}
 
@@ -171,7 +172,7 @@ def test_high_shipping_does_not_get_filtered_but_loses_on_landed():
     )
     # Bucket landed: [20, 25, 38, 43]; median = (25+38)/2 = 31.5;
     # threshold ⇒ landed < 23.625. Only id 1 (20) qualifies.
-    assert [d["id"] for d in deals] == [1]
+    assert [d.id for d in deals] == [1]
 
 
 # ── Effective-discount gate + big_deal flag ──────────────────────────────────
@@ -184,7 +185,7 @@ def test_gate_just_below_35pct_qualifies():
         _listing(3, buyer_price=95.0, shipping_buyer_price=5.0),   # 100
     ]
     deals = evaluator.evaluate_release_group(listings, deal_threshold=0.35, my_country="Netherlands")
-    assert [d["id"] for d in deals] == [1] and deals[0]["discount_pct"] == 36
+    assert [d.id for d in deals] == [1] and deals[0].discount_pct == 36
 
 
 def test_gate_just_above_35pct_rejected():
@@ -208,7 +209,7 @@ def test_big_deal_flag_fires_at_threshold():
         listings, deal_threshold=0.35, my_country="Netherlands", big_deal_threshold=0.50,
     )
     # median 50; landed 20 → 60% → big_deal
-    assert deals[0]["discount_pct"] == 60 and deals[0]["big_deal"] is True
+    assert deals[0].discount_pct == 60 and deals[0].big_deal is True
 
 
 # ── VAT estimate ─────────────────────────────────────────────────────────────
@@ -239,13 +240,13 @@ def test_vat_penalises_import_in_ranking():
         listings, deal_threshold=0.35, my_country="Netherlands",
         vat_rate=0.21, big_deal_threshold=0.50,
     )
-    by_id = {d["id"]: d for d in deals}
+    by_id = {d.id: d for d in deals}
     # Bucket effective median = (24.2 + 60)/2 = 42.1; both 1 and 2 qualify.
-    assert by_id[1]["effective_discount"] > by_id[2]["effective_discount"]
-    assert by_id[1]["big_deal"] is True            # 52% off
-    assert by_id[2]["big_deal"] is False           # 42% off after VAT
-    assert by_id[2]["vat_estimated"] is True and by_id[2]["vat_amount"] == 4.2
-    assert by_id[1]["vat_estimated"] is False
+    assert by_id[1].effective_discount > by_id[2].effective_discount
+    assert by_id[1].big_deal is True            # 52% off
+    assert by_id[2].big_deal is False           # 42% off after VAT
+    assert by_id[2].vat_estimated is True and by_id[2].vat_amount == 4.2
+    assert by_id[1].vat_estimated is False
 
 
 # ── Shipping region ─────────────────────────────────────────────────────────

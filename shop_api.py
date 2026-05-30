@@ -18,6 +18,8 @@ from typing import NamedTuple
 
 from curl_cffi import requests as cf_requests
 
+from models import Listing
+
 logger = logging.getLogger(__name__)
 
 # Bump this when Chrome ships a major version and curl_cffi adds support.
@@ -86,7 +88,7 @@ def _parse_date(raw) -> datetime | None:
         return None
 
 
-def parse_listing(item: dict) -> dict | None:
+def parse_listing(item: dict) -> Listing | None:
     """Normalize one /sell_item entry. Returns None to exclude (no id, or unavailable)."""
     item_id = item.get("itemId")
     if item_id is None:
@@ -108,51 +110,48 @@ def parse_listing(item: dict) -> dict | None:
     genres = release.get("genres") or []
     genre_names = [g.get("name") for g in genres if isinstance(g, dict) and g.get("name")]
 
-    return {
-        "id": int(item_id),
-        "listed_at": _parse_date(item.get("listedDate")),
-        "media_condition": item.get("mediaCondition"),
-        "sleeve_condition": item.get("sleeveCondition"),
+    return Listing(
+        id=int(item_id),
+        listed_at=_parse_date(item.get("listedDate")),
+        media_condition=item.get("mediaCondition"),
+        sleeve_condition=item.get("sleeveCondition"),
 
         # Native (seller) currency
-        "price": float(price.get("amount") or 0.0),
-        "currency": price.get("currencyCode"),
+        price=float(price.get("amount") or 0.0),
+        currency=price.get("currencyCode"),
 
         # Pre-converted to buyer's account currency (what we compare against medians)
-        "buyer_price": float(price.get("buyerItemPrice") or price.get("amount") or 0.0),
-        "buyer_currency": price.get("buyerCurrencyCode") or price.get("currencyCode"),
-        "price_usd": float(price.get("amountUsd") or 0.0),
+        buyer_price=float(price.get("buyerItemPrice") or price.get("amount") or 0.0),
+        buyer_currency=price.get("buyerCurrencyCode") or price.get("currencyCode"),
 
-        # Previous price (for drop detection) — Discogs sets prev == current when no change
-        "previous_price": float(prev_price.get("amount") or 0.0) or None,
-        "previous_buyer_price": float(prev_price.get("buyerItemPrice") or 0.0) or None,
-        "previous_currency": prev_price.get("currencyCode"),
+        # Previous buyer-currency price (reserved for a future "was €X" UI line).
+        # Discogs sets prev == current when there's been no change.
+        previous_buyer_price=float(prev_price.get("buyerItemPrice") or 0.0) or None,
 
-        "shipping_price": shipping.get("shippingPrice"),
-        "shipping_buyer_price": shipping.get("buyerShippingPrice"),
-        "shipping_free_min": shipping.get("freeShippingMin"),
+        shipping_price=shipping.get("shippingPrice"),
+        shipping_buyer_price=shipping.get("buyerShippingPrice"),
 
-        "image_url": item.get("imageUrl"),
-        "comments": item.get("comments") or "",
-        "accepts_offers": bool(item.get("allowsOffers")),
-        "is_deal_remote": bool(item.get("isDeal")),
+        image_url=item.get("imageUrl"),
+        comments=item.get("comments") or "",
+        accepts_offers=bool(item.get("allowsOffers")),
+        is_deal_remote=bool(item.get("isDeal")),
 
-        "release_id": release.get("releaseId"),
-        "release_title": release.get("title"),
-        "release_artist": artist_name,
-        "release_year": release.get("year"),
-        "release_country": release.get("country"),
-        "release_format": release.get("majorFormat"),
-        "release_genres": genre_names,
+        release_id=release.get("releaseId"),
+        release_title=release.get("title"),
+        release_artist=artist_name,
+        release_year=release.get("year"),
+        release_country=release.get("country"),
+        release_format=release.get("majorFormat"),
+        release_genres=genre_names,
 
-        "seller_uid": seller.get("uid"),
-        "seller_username": seller.get("name"),
-        "seller_rating": seller.get("rating"),
-        "seller_rating_count": seller.get("ratingCount"),
-        "ships_from": seller.get("shipsFrom"),
+        seller_uid=seller.get("uid"),
+        seller_username=seller.get("name"),
+        seller_rating=seller.get("rating"),
+        seller_rating_count=seller.get("ratingCount"),
+        ships_from=seller.get("shipsFrom"),
 
-        "listing_url": f"https://www.discogs.com/sell/item/{item_id}",
-    }
+        listing_url=f"https://www.discogs.com/sell/item/{item_id}",
+    )
 
 
 # ── Pagination ──────────────────────────────────────────────────────────────
@@ -232,8 +231,8 @@ def fetch_listings(
             parsed = parse_listing(item)
             if parsed is None:
                 continue
-            if listed_after is not None and parsed["listed_at"] is not None:
-                if parsed["listed_at"] <= listed_after:
+            if listed_after is not None and parsed.listed_at is not None:
+                if parsed.listed_at <= listed_after:
                     hit_cutoff = True
                     break
             listings.append(parsed)

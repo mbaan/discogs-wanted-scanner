@@ -18,6 +18,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 from evaluator import condition_short, currency_symbol
+from models import Deal
 
 logger = logging.getLogger(__name__)
 
@@ -37,7 +38,7 @@ except OSError as exc:
 
 class Notifier(ABC):
     @abstractmethod
-    def send(self, deals: list[dict], run_time: datetime, **kwargs) -> None:
+    def send(self, deals: list[Deal], run_time: datetime, **kwargs) -> None:
         """Send a batch alert for the given deals."""
 
 
@@ -52,7 +53,7 @@ class EmailNotifier(Notifier):
 
     def send(
         self,
-        deals: list[dict],
+        deals: list[Deal],
         run_time: datetime,
         extra_count: int = 0,
         session_days_left: int | None = None,
@@ -119,12 +120,12 @@ def _money(amount: float | int | None, ccy: str | None) -> str:
     return f"{currency_symbol(ccy)}{float(amount):.2f}"
 
 
-def _heading(deal: dict) -> str:
-    artist = deal.get("release_artist") or ""
-    title = deal.get("release_title") or "Unknown"
-    year = deal.get("release_year")
-    fmt = deal.get("release_format")
-    country = deal.get("release_country")
+def _heading(deal) -> str:
+    artist = deal.release_artist or ""
+    title = deal.release_title or "Unknown"
+    year = deal.release_year
+    fmt = deal.release_format
+    country = deal.release_country
     head = f"{artist} — {title}" if artist else title
     suffix_bits = []
     if year:
@@ -135,59 +136,59 @@ def _heading(deal: dict) -> str:
         suffix_bits.append(country)
     suffix = " ".join(suffix_bits)
     cond_pair = (
-        f"{condition_short(deal.get('media_condition'))}/"
-        f"{condition_short(deal.get('sleeve_condition'))}"
+        f"{condition_short(deal.media_condition)}/"
+        f"{condition_short(deal.sleeve_condition)}"
     )
     if suffix:
         return f"{head} · {suffix} · {cond_pair}"
     return f"{head} · {cond_pair}"
 
 
-def _price_line(deal: dict) -> str:
-    item = deal.get("buyer_price") or deal.get("price")
-    item_ccy = deal.get("buyer_currency") or deal.get("currency")
-    ship = deal.get("shipping_buyer_price") or deal.get("shipping_price") or 0
-    landed_amt = deal.get("landed_price")
-    landed_ccy = deal.get("landed_currency") or item_ccy
+def _price_line(deal) -> str:
+    item = deal.buyer_price or deal.price
+    item_ccy = deal.buyer_currency or deal.currency
+    ship = deal.shipping_buyer_price or deal.shipping_price or 0
+    landed_amt = deal.landed_price
+    landed_ccy = deal.landed_currency or item_ccy
     cost = (
         f"{_money(landed_amt, landed_ccy)} landed "
         f"({_money(item, item_ccy)} + {_money(ship, landed_ccy)} ship)"
     )
-    if deal.get("vat_estimated") and deal.get("vat_amount"):
-        cost += f" + ~{_money(deal.get('vat_amount'), landed_ccy)} est. import VAT"
+    if deal.vat_estimated and deal.vat_amount:
+        cost += f" + ~{_money(deal.vat_amount, landed_ccy)} est. import VAT"
     parts = [
         cost,
-        deal.get("deal_reason", ""),
+        deal.deal_reason,
         _discogs_wide_snippet(deal),
         _historical_floor_snippet(deal),
     ]
     return " · ".join(p for p in parts if p)
 
 
-def _discogs_wide_snippet(deal: dict) -> str:
+def _discogs_wide_snippet(deal) -> str:
     """`Discogs-wide NM ≈ €X.XX` — empty when no annotation present."""
-    value = deal.get("discogs_wide_median_value")
+    value = deal.discogs_wide_median_value
     if value is None:
         return ""
-    cond = condition_short(deal.get("media_condition"))
-    ccy = deal.get("discogs_wide_median_currency") or deal.get("landed_currency")
+    cond = condition_short(deal.media_condition)
+    ccy = deal.discogs_wide_median_currency or deal.landed_currency
     return f"Discogs-wide {cond} ≈ {_money(value, ccy)}"
 
 
-def _historical_floor_snippet(deal: dict) -> str:
+def _historical_floor_snippet(deal) -> str:
     """`all-time low (−X%, N pts)` — empty when no historical-floor annotation."""
-    pct = deal.get("historical_floor_pct")
+    pct = deal.historical_floor_pct
     if not pct:
         return ""
-    pts = deal.get("historical_data_points")
+    pts = deal.historical_data_points
     return f"all-time low (−{pct}%, {pts} pts)" if pts else f"all-time low (−{pct}%)"
 
 
-def _seller_line(deal: dict) -> str:
-    name = deal.get("seller_username") or "—"
-    rating = deal.get("seller_rating")
+def _seller_line(deal) -> str:
+    name = deal.seller_username or "—"
+    rating = deal.seller_rating
     rating_str = f" {rating:.1f}%" if isinstance(rating, (int, float)) else ""
-    region = deal.get("shipping_region") or deal.get("ships_from") or ""
+    region = deal.shipping_region or deal.ships_from or ""
     return f"{name}{rating_str} · {region}" if region else f"{name}{rating_str}"
 
 
@@ -246,13 +247,13 @@ def _shipping_summary(hint: dict) -> str:
     return " · ".join(parts)
 
 
-def _shipping_html(deal: dict) -> str:
-    hint = deal.get("shipping_hint")
-    picks = deal.get("_seller_picks") or []
-    others = deal.get("_seller_total_others") or 0
+def _shipping_html(deal) -> str:
+    hint = deal.shipping_hint
+    picks = deal.seller_picks or []
+    others = deal.seller_total_others or 0
     if not hint and not picks:
         return ""
-    seller = _h((hint or {}).get("seller") or deal.get("seller_username") or "this seller")
+    seller = _h((hint or {}).get("seller") or deal.seller_username or "this seller")
     head = f"📦 {seller}" + (f" — {others} more on your wantlist" if others else "")
     rows = [f'<div style="margin-top:8px; font-size:13px; color:#444; font-weight:600;">{head}</div>']
     if hint:
@@ -273,13 +274,13 @@ def _shipping_html(deal: dict) -> str:
     return '<div style="margin-top:6px; padding-top:6px; border-top:1px dashed #eee;">' + "".join(rows) + "</div>"
 
 
-def _shipping_text(deal: dict) -> list[str]:
-    hint = deal.get("shipping_hint")
-    picks = deal.get("_seller_picks") or []
-    others = deal.get("_seller_total_others") or 0
+def _shipping_text(deal) -> list[str]:
+    hint = deal.shipping_hint
+    picks = deal.seller_picks or []
+    others = deal.seller_total_others or 0
     if not hint and not picks:
         return []
-    seller = (hint or {}).get("seller") or deal.get("seller_username") or "this seller"
+    seller = (hint or {}).get("seller") or deal.seller_username or "this seller"
     lines = [f"📦 {seller}" + (f" — {others} more on your wantlist" if others else "")]
     if hint:
         summ = _shipping_summary(hint)
@@ -295,8 +296,8 @@ def _shipping_text(deal: dict) -> list[str]:
     return lines
 
 
-def _deal_html(deal: dict) -> str:
-    img = deal.get("image_url")
+def _deal_html(deal) -> str:
+    img = deal.image_url
     img_html = (
         f'<img src="{_h(img)}" alt="" width="64" height="64" '
         f'style="display:block; border-radius:4px; object-fit:cover; flex:0 0 auto;">'
@@ -305,35 +306,35 @@ def _deal_html(deal: dict) -> str:
 
     price_line_html = _h(_price_line(deal))
 
-    if deal.get("big_deal"):
+    if deal.big_deal:
         price_line_html += (
             ' <span style="background:#ffe0e0; color:#b71c1c; padding:1px 6px; '
             'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
             'border:1px solid #f0b0b0;">🔥 50%+</span>'
         )
 
-    if deal.get("is_deal_remote"):
+    if deal.is_deal_remote:
         price_line_html += (
             ' <span style="background:#fff3c4; color:#7a5b00; padding:1px 6px; '
             'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
             'border:1px solid #f0d678;">★ Discogs Deal</span>'
         )
 
-    if deal.get("historical_floor_pct"):
+    if deal.historical_floor_pct:
         price_line_html += (
             ' <span style="background:#00695c; color:#fff; padding:1px 6px; '
             'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
             'border:1px solid #00897b;">⬇ All-time low</span>'
         )
 
-    comments = (deal.get("comments") or "").strip()
+    comments = (deal.comments or "").strip()
     comments_html = (
         f'<div style="margin-top:4px; font-size:12px; color:#666; font-style:italic;">'
         f'"{_h(comments)}"</div>'
         if comments else ""
     )
 
-    siblings_html = "".join(_sibling_html(s) for s in (deal.get("_siblings") or []))
+    siblings_html = "".join(_sibling_html(s) for s in (deal.siblings or []))
     shipping_html = _shipping_html(deal)
 
     return f"""
@@ -346,7 +347,7 @@ def _deal_html(deal: dict) -> str:
         <div style="font-size:13px; color:#666; margin-top:2px;">{_h(_seller_line(deal))}</div>
         {comments_html}
         <div style="margin-top:8px;">
-          <a href="{_h(deal.get("listing_url") or "#")}"
+          <a href="{_h(deal.listing_url or "#")}"
              style="background:#333; color:#fff; padding:4px 10px; text-decoration:none;
                     border-radius:3px; font-size:12px;">View listing →</a>
         </div>
@@ -382,7 +383,7 @@ def _scan_summary(scan_counts: dict | None) -> str:
 
 
 def _build_html(
-    deals: list[dict], run_time: datetime, extra_count: int,
+    deals: list[Deal], run_time: datetime, extra_count: int,
     session_days_left: int | None = None,
     scan_counts: dict | None = None,
 ) -> str:
@@ -445,7 +446,7 @@ def _build_html(
 
 
 def _build_text(
-    deals: list[dict], run_time: datetime, extra_count: int,
+    deals: list[Deal], run_time: datetime, extra_count: int,
     session_days_left: int | None = None,
     scan_counts: dict | None = None,
 ) -> str:
@@ -463,18 +464,18 @@ def _build_text(
         lines.append("")
         lines.append(_heading(d))
         line = _price_line(d)
-        if d.get("big_deal"):
+        if d.big_deal:
             line += " · 🔥 50%+"
-        if d.get("is_deal_remote"):
+        if d.is_deal_remote:
             line += " · ★ Discogs Deal"
-        if d.get("historical_floor_pct"):
+        if d.historical_floor_pct:
             line += " · ⬇ all-time low"
         lines.append(line)
         lines.append(_seller_line(d))
-        if d.get("comments"):
-            lines.append(f'"{d["comments"]}"')
-        lines.append(d.get("listing_url", ""))
-        for s in d.get("_siblings") or []:
+        if d.comments:
+            lines.append(f'"{d.comments}"')
+        lines.append(d.listing_url or "")
+        for s in d.siblings or []:
             lines.append(_sibling_text(s))
         lines.extend(_shipping_text(d))
         lines.append("-" * 60)
