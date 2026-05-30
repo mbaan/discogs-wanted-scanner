@@ -43,13 +43,13 @@ class Notifier(ABC):
 
 
 class EmailNotifier(Notifier):
-    def __init__(self, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_from, alert_to):
+    def __init__(self, smtp_host, smtp_port, smtp_user, smtp_pass, smtp_from, smtp_to):
         self.smtp_host = smtp_host
         self.smtp_port = smtp_port
         self.smtp_user = smtp_user
         self.smtp_pass = smtp_pass
         self.smtp_from = smtp_from
-        self.alert_to = alert_to
+        self.smtp_to = smtp_to
 
     def send(
         self,
@@ -68,18 +68,18 @@ class EmailNotifier(Notifier):
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
         msg["From"] = self.smtp_from
-        msg["To"] = self.alert_to
+        msg["To"] = self.smtp_to
         msg.attach(MIMEText(_build_text(deals, run_time, extra_count, session_days_left, scan_counts=scan_counts), "plain"))
         msg.attach(MIMEText(_build_html(deals, run_time, extra_count, session_days_left, scan_counts=scan_counts), "html"))
 
         self._send_message(msg)
-        logger.info("Email sent to %s (%d deal(s), %d extra)", self.alert_to, n, extra_count)
+        logger.info("Email sent to %s (%d deal(s), %d extra)", self.smtp_to, n, extra_count)
 
     def send_admin_alert(self, subject: str, body: str) -> None:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"[Discogs Watcher] {subject}"
         msg["From"] = self.smtp_from
-        msg["To"] = self.alert_to
+        msg["To"] = self.smtp_to
         msg.attach(MIMEText(body, "plain"))
         self._send_message(msg)
         logger.info("Admin alert sent: %s", subject)

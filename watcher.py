@@ -100,98 +100,107 @@ def _parse_ts(raw: str | None) -> datetime | None:
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-def _smtp(key: str) -> str:
-    """Like _require, but tolerant of placeholders in dry-run mode."""
-    val = os.getenv(key, "").strip()
-    if val:
-        return val
-    if _dry_run:
-        return f"<dry-run:{key}>"
-    logger.error("Missing required SMTP config: %s (set in .env, or run with DRY_RUN=1)", key)
-    sys.exit(1)
+# Every knob the watcher reads from .env is *required* — there are no silent
+# production defaults. A normal run with any required key missing aborts with the
+# full list of what's absent. A DRY_RUN smoke-test is the one exception: missing
+# keys fall back to the example values so the pipeline runs without a populated
+# .env. The handful of vars below stay optional because their unset state is a
+# meaningful "feature off", not a hidden default.
+
+_BOOL_TRUE = ("1", "true", "yes", "on")
+_BOOL_FALSE = ("0", "false", "no", "off")
 
 
-def _opt_float(key: str, default: float) -> float:
-    raw = os.getenv(key, "").strip()
-    if not raw:
-        return default
-    try:
-        return float(raw)
-    except ValueError:
-        logger.warning("Invalid %s=%r, using %s", key, raw, default)
-        return default
+def _parse_bool(raw: str) -> bool:
+    low = raw.lower()
+    if low in _BOOL_TRUE:
+        return True
+    if low in _BOOL_FALSE:
+        return False
+    raise ValueError(f"expected a boolean ({'/'.join(_BOOL_TRUE + _BOOL_FALSE)})")
+
+
+def _parse_digest_mode(raw: str) -> str:
+    mode = raw.lower()
+    if mode not in ("hourly", "daily"):
+        raise ValueError("expected 'hourly' or 'daily'")
+    return mode
 
 
 def _opt_int(key: str, default: int | None) -> int | None:
+    """Optional integer for a feature-toggle knob (unset = feature off)."""
     raw = os.getenv(key, "").strip()
     if not raw:
         return default
     try:
         return int(raw)
     except ValueError:
-        logger.warning("Invalid %s=%r, using %s", key, raw, default)
+        logger.warning("Invalid %s=%r, ignoring", key, raw)
         return default
-
-
-def _opt_bool(key: str, default: bool) -> bool:
-    raw = os.getenv(key, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return default
-
-
-def _opt_condition(key: str, default: str) -> str:
-    """A media/sleeve condition floor, given as a short grade ('NM') or full
-    Discogs string. Normalized to canonical; a typo exits rather than silently
-    widening the quality bar."""
-    raw = os.getenv(key, "").strip() or default
-    try:
-        return evaluator.parse_condition(raw)
-    except ValueError as exc:
-        logger.error("Invalid %s: %s", key, exc)
-        sys.exit(1)
 
 
 def _load_config() -> dict:
     load_dotenv(_ENV_FILE)
-    digest_mode = os.getenv("DIGEST_MODE", "hourly").strip().lower()
-    if digest_mode not in ("hourly", "daily"):
-        logger.warning("Invalid DIGEST_MODE=%r, using hourly", digest_mode)
-        digest_mode = "hourly"
-    return {
-        "my_country": os.getenv("MY_COUNTRY", "Netherlands").strip(),
-        "min_media_condition": _opt_condition("MIN_MEDIA_CONDITION", "NM"),
-        "min_sleeve_condition": _opt_condition("MIN_SLEEVE_CONDITION", "NM"),
-        "deal_threshold": _opt_float("DEAL_THRESHOLD", 0.35),
-        "vat_rate": _opt_float("VAT_RATE", 0.21),
-        "big_deal_threshold": _opt_float("BIG_DEAL_THRESHOLD", 0.50),
-        "price_drop_threshold": _opt_float("PRICE_DROP_THRESHOLD", 0.05),
+    missing: list[str] = []
+
+    def req(key: str, parse, fallback):
+        """A required .env value. Missing → recorded (and, in dry-run only,
+        replaced by `fallback`); malformed → aborts immediately."""
+        raw = os.getenv(key, "").strip()
+        if not raw:
+            missing.append(key)
+            return fallback
+        try:
+            return parse(raw)
+        except ValueError as exc:
+            logger.error("Invalid %s=%r: %s", key, raw, exc)
+            sys.exit(1)
+
+    cfg = {
+        "my_country": req("MY_COUNTRY", str, "Netherlands"),
+        "min_media_condition": req("MIN_MEDIA_CONDITION", evaluator.parse_condition, "Near Mint (NM or M-)"),
+        "min_sleeve_condition": req("MIN_SLEEVE_CONDITION", evaluator.parse_condition, "Near Mint (NM or M-)"),
+        "deal_threshold": req("DEAL_THRESHOLD", float, 0.4),
+        "vat_rate": req("VAT_RATE", float, 0.21),
+        "big_deal_threshold": req("BIG_DEAL_THRESHOLD", float, 0.6),
+        "price_drop_threshold": req("PRICE_DROP_THRESHOLD", float, 0.05),
+        "smtp_host": req("SMTP_HOST", str, "127.0.0.1"),
+        "smtp_port": req("SMTP_PORT", int, 1025),
+        "smtp_user": req("SMTP_USER", str, "you@example.com"),
+        "smtp_pass": req("SMTP_PASS", str, "your_smtp_password"),
+        "smtp_from": req("SMTP_FROM", str, "you@example.com"),
+        "smtp_to": req("SMTP_TO", str, "you@example.com"),
+        "digest_mode": req("DIGEST_MODE", _parse_digest_mode, "hourly"),
+        "digest_hour_utc": req("DIGEST_HOUR_UTC", int, 7),
+        "max_deals_per_email": req("MAX_DEALS_PER_EMAIL", int, 0),  # 0 = no cap
+        "max_emails_per_day": req("MAX_EMAILS_PER_DAY", int, 4),
+        "group_by_release": req("GROUP_BY_RELEASE", _parse_bool, True),
+        "max_siblings_per_release": req("MAX_SIBLINGS_PER_RELEASE", int, 1),
+        "max_pages_per_run": req("MAX_PAGES_PER_RUN", int, 30),
+        "shipping_hints": req("SHIPPING_HINTS", _parse_bool, True),
+        "est_grams_per_vinyl": req("EST_GRAMS_PER_VINYL", int, 250),
+        "max_seller_picks": req("MAX_SELLER_PICKS", int, 5),
+        "shipping_policy_ttl_days": req("SHIPPING_POLICY_TTL_DAYS", int, 30),
+        "price_history_days": req("PRICE_HISTORY_DAYS", int, 365),
+        "price_history_min_points": req("PRICE_HISTORY_MIN_POINTS", int, 3),
+        # ── Optional feature toggles (unset = feature off, not a hidden default) ──
         "seller_rating_min": _opt_int("SELLER_RATING_MIN", None),
-        "smtp_host": _smtp("SMTP_HOST"),
-        "smtp_port": int(os.getenv("SMTP_PORT", "1025")),
-        "smtp_user": _smtp("SMTP_USER"),
-        "smtp_pass": _smtp("SMTP_PASS"),
-        "smtp_from": _smtp("SMTP_FROM"),
-        "alert_to": _smtp("ALERT_TO"),
-        "digest_mode": digest_mode,
-        "digest_hour_utc": _opt_int("DIGEST_HOUR_UTC", 7),
-        "max_deals_per_email": _opt_int("MAX_DEALS_PER_EMAIL", 0),  # 0 = no cap, show all
-        "max_emails_per_day": _opt_int("MAX_EMAILS_PER_DAY", 4),
-        "group_by_release": _opt_bool("GROUP_BY_RELEASE", True),
-        "max_siblings_per_release": _opt_int("MAX_SIBLINGS_PER_RELEASE", 1),
-        "max_pages_per_run": _opt_int("MAX_PAGES_PER_RUN", 30),
         "healthcheck_url": os.getenv("HEALTHCHECK_URL", "").strip() or None,
         "discogs_token": os.getenv("DISCOGS_TOKEN", "").strip() or None,
         "discogs_username": os.getenv("DISCOGS_USERNAME", "").strip() or None,
-        "shipping_hints": _opt_bool("SHIPPING_HINTS", True),
-        "est_grams_per_vinyl": _opt_int("EST_GRAMS_PER_VINYL", 250),
-        "max_seller_picks": _opt_int("MAX_SELLER_PICKS", 5),
-        "shipping_policy_ttl_days": _opt_int("SHIPPING_POLICY_TTL_DAYS", 30),
-        "price_history_days": _opt_int("PRICE_HISTORY_DAYS", 365),
-        "price_history_min_points": _opt_int("PRICE_HISTORY_MIN_POINTS", 3),
     }
+
+    if missing:
+        if _dry_run:
+            logger.warning("DRY_RUN: using example values for unset .env keys: %s", ", ".join(missing))
+        else:
+            logger.error(
+                "Missing required .env config: %s — set them in .env "
+                "(see .env.example), or run with DRY_RUN=1 to use example values.",
+                ", ".join(missing),
+            )
+            sys.exit(1)
+    return cfg
 
 
 # ── Cookie-expiry pre-check ──────────────────────────────────────────────────
@@ -235,7 +244,7 @@ def _maybe_send_admin_alert(state, cfg, now, key, subject, body):
     notifier = EmailNotifier(
         smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],
         smtp_user=cfg["smtp_user"], smtp_pass=cfg["smtp_pass"],
-        smtp_from=cfg["smtp_from"], alert_to=cfg["alert_to"],
+        smtp_from=cfg["smtp_from"], smtp_to=cfg["smtp_to"],
     )
     try:
         notifier.send_admin_alert(subject, body)
@@ -441,7 +450,7 @@ def main() -> None:
             notifier = EmailNotifier(
                 smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],
                 smtp_user=cfg["smtp_user"], smtp_pass=cfg["smtp_pass"],
-                smtp_from=cfg["smtp_from"], alert_to=cfg["alert_to"],
+                smtp_from=cfg["smtp_from"], smtp_to=cfg["smtp_to"],
             )
             try:
                 notifier.send(to_send, now, extra_count=extra, session_days_left=session_days_left, scan_counts=scan_counts)

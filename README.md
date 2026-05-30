@@ -81,13 +81,13 @@ configurable fraction below it.
 - **Effective cost** = landed cost **plus an estimated import-VAT uplift** for
   non-EU origins (UK is non-EU post-Brexit). EU/domestic prices already include
   VAT and are left untouched, so the median comparison stays apples-to-apples.
-- A listing is a deal at `DEAL_THRESHOLD` (default **35%**) below the bucket
-  median. Deals are ranked **deepest discount first**; anything at or beyond
-  `BIG_DEAL_THRESHOLD` (default 50%) gets a 🔥 badge.
+- A listing is a deal at `DEAL_THRESHOLD` (the example `.env` uses **40%**) below
+  the bucket median. Deals are ranked **deepest discount first**; anything at or
+  beyond `BIG_DEAL_THRESHOLD` (example 60%) gets a 🔥 badge.
 - Solo / Discogs-flagged listings have no computed in-pool discount and sort last.
 
 A previously-alerted listing only re-alerts when its price has since dropped a
-further `PRICE_DROP_THRESHOLD` (default 5%).
+further `PRICE_DROP_THRESHOLD` (example 5%).
 
 **All-time low.** Separately from the in-pool median, the watcher remembers the
 lowest landed price it has actually observed for each release+condition over a
@@ -98,14 +98,22 @@ badge stays quiet until there's enough history to mean something.
 
 ## Tuning knobs (`.env`)
 
-| Var | Default | Effect |
+Every var below is **required** — the watcher aborts on startup with the full
+list of anything unset (run with `DRY_RUN=1` to fall back to example values).
+Copy `.env.example` and edit. The exceptions, marked _(optional)_, are feature
+toggles whose unset state means "feature off", not a hidden default. The
+`SMTP_*` keys live in the [Email](#email) section.
+
+| Var | Example | Effect |
 |---|---|---|
 | `MY_COUNTRY` | `Netherlands` | Your country — classifies shipping as domestic / EU / international and drives the VAT estimate. |
-| `DEAL_THRESHOLD` | `0.35` | How far below the bucket median to qualify. Lower = more alerts. |
-| `BIG_DEAL_THRESHOLD` | `0.50` | Effective discount that earns the 🔥 badge. |
+| `MIN_MEDIA_CONDITION` | `NM` | Minimum vinyl grade kept (`M`/`NM`/`VG+`/… or the full Discogs string). |
+| `MIN_SLEEVE_CONDITION` | `NM` | Minimum sleeve grade kept. Both media *and* sleeve must clear their floor. |
+| `DEAL_THRESHOLD` | `0.4` | How far below the bucket median to qualify. Lower = more alerts. |
+| `BIG_DEAL_THRESHOLD` | `0.6` | Effective discount that earns the 🔥 badge. |
 | `VAT_RATE` | `0.21` | Import-VAT uplift applied to non-EU listings (`0` disables). |
 | `PRICE_DROP_THRESHOLD` | `0.05` | Re-alert when a seen listing's price drops this much further. |
-| `SELLER_RATING_MIN` | (unset) | Only fetch listings from sellers with ≥ this rating (0–100). |
+| `SELLER_RATING_MIN` | _(optional)_ | Only fetch listings from sellers with ≥ this rating (0–100). |
 | `DIGEST_MODE` | `hourly` | `daily` accumulates and emails once at `DIGEST_HOUR_UTC`. |
 | `DIGEST_HOUR_UTC` | `7` | Hour (UTC) to flush when `DIGEST_MODE=daily`. |
 | `GROUP_BY_RELEASE` | `true` | Collapse multiple sellers per release into primary + siblings. |
@@ -113,15 +121,15 @@ badge stays quiet until there's enough history to mean something.
 | `MAX_DEALS_PER_EMAIL` | `0` | `0` = no cap. |
 | `MAX_EMAILS_PER_DAY` | `4` | Safety brake against runaway alerting. |
 | `MAX_PAGES_PER_RUN` | `30` | Pagination cap on `/sell_item`. |
-| `DISCOGS_TOKEN` | (unset) | Optional PAT — enables Discogs-wide median annotation + shipping hints (see below). |
-| `DISCOGS_USERNAME` | (unset) | With `DISCOGS_TOKEN`, adds an "X of Y wantlist releases for sale" summary. |
+| `DISCOGS_TOKEN` | _(optional)_ | PAT — enables Discogs-wide median annotation + shipping hints (see below). |
+| `DISCOGS_USERNAME` | _(optional)_ | With `DISCOGS_TOKEN`, adds an "X of Y wantlist releases for sale" summary. |
 | `SHIPPING_HINTS` | `true` | Show per-seller shipping policy + other wantlist items from the same seller (needs `DISCOGS_TOKEN`). |
 | `EST_GRAMS_PER_VINYL` | `250` | Per-record weight estimate for weight-based shipping tiers. |
 | `MAX_SELLER_PICKS` | `5` | Max "also wanted from this seller" rows per deal. |
 | `SHIPPING_POLICY_TTL_DAYS` | `30` | How long a fetched shipping policy stays cached. |
 | `PRICE_HISTORY_DAYS` | `365` | Rolling window of observed prices kept in `state.json` for the all-time-low signal. |
 | `PRICE_HISTORY_MIN_POINTS` | `3` | Observations required before an "⬇ all-time low" badge can fire. |
-| `HEALTHCHECK_URL` | (unset) | Optional ping on each successful run (e.g. healthchecks.io). |
+| `HEALTHCHECK_URL` | _(optional)_ | Ping on each successful run (e.g. healthchecks.io). |
 
 ## Optional: Discogs PAT enrichment
 
