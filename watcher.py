@@ -29,7 +29,6 @@ _STATE_FILE = _DIR / "state.json"
 # ── Logging ──────────────────────────────────────────────────────────────────
 
 _debug = os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
-_dry_run = os.getenv("DRY_RUN", "").lower() in ("1", "true", "yes")
 
 # cron + minimal-install hosts default to C/latin-1; force UTF-8 so log
 # lines with currency symbols and em-dashes don't crash logging.
@@ -100,24 +99,20 @@ def _parse_ts(raw: str | None) -> datetime | None:
 
 # ── Config ───────────────────────────────────────────────────────────────────
 
-# Every knob the watcher reads from .env is *required* — there are no silent
-# production defaults. A normal run with any required key missing aborts with the
-# full list of what's absent. A DRY_RUN smoke-test is the one exception: missing
-# keys fall back to the example values so the pipeline runs without a populated
-# .env. The handful of vars below stay optional because their unset state is a
-# meaningful "feature off", not a hidden default.
-
-_BOOL_TRUE = ("1", "true", "yes", "on")
-_BOOL_FALSE = ("0", "false", "no", "off")
+# Every knob the watcher reads from .env is *required* — there are NO defaults in
+# this file. A run with any required key missing aborts with the full list of
+# what's absent; copy .env.example and fill it in. The handful of vars at the
+# bottom stay optional because their unset state is a meaningful "feature off",
+# not a hidden default.
 
 
 def _parse_bool(raw: str) -> bool:
     low = raw.lower()
-    if low in _BOOL_TRUE:
+    if low in ("1", "true", "yes", "on"):
         return True
-    if low in _BOOL_FALSE:
+    if low in ("0", "false", "no", "off"):
         return False
-    raise ValueError(f"expected a boolean ({'/'.join(_BOOL_TRUE + _BOOL_FALSE)})")
+    raise ValueError("expected a boolean (true/false)")
 
 
 def _parse_digest_mode(raw: str) -> str:
@@ -127,29 +122,35 @@ def _parse_digest_mode(raw: str) -> str:
     return mode
 
 
-def _opt_int(key: str, default: int | None) -> int | None:
-    """Optional integer for a feature-toggle knob (unset = feature off)."""
-    raw = os.getenv(key, "").strip()
-    if not raw:
-        return default
+def _opt(key: str):
+    """An optional feature-toggle value: returns the trimmed string or None when
+    unset (None = feature off, which is a real state, not a hidden default)."""
+    return os.getenv(key, "").strip() or None
+
+
+def _opt_int(key: str) -> int | None:
+    """Optional integer toggle; unset or malformed → None (feature off)."""
+    raw = _opt(key)
+    if raw is None:
+        return None
     try:
         return int(raw)
     except ValueError:
         logger.warning("Invalid %s=%r, ignoring", key, raw)
-        return default
+        return None
 
 
 def _load_config() -> dict:
     load_dotenv(_ENV_FILE)
     missing: list[str] = []
 
-    def req(key: str, parse, fallback):
-        """A required .env value. Missing → recorded (and, in dry-run only,
-        replaced by `fallback`); malformed → aborts immediately."""
+    def req(key: str, parse):
+        """A required .env value. Missing → recorded (we abort once, below);
+        malformed → aborts immediately."""
         raw = os.getenv(key, "").strip()
         if not raw:
             missing.append(key)
-            return fallback
+            return None  # never used: we abort before cfg is consumed
         try:
             return parse(raw)
         except ValueError as exc:
@@ -157,49 +158,45 @@ def _load_config() -> dict:
             sys.exit(1)
 
     cfg = {
-        "my_country": req("MY_COUNTRY", str, "Netherlands"),
-        "min_media_condition": req("MIN_MEDIA_CONDITION", evaluator.parse_condition, "Near Mint (NM or M-)"),
-        "min_sleeve_condition": req("MIN_SLEEVE_CONDITION", evaluator.parse_condition, "Near Mint (NM or M-)"),
-        "deal_threshold": req("DEAL_THRESHOLD", float, 0.4),
-        "vat_rate": req("VAT_RATE", float, 0.21),
-        "big_deal_threshold": req("BIG_DEAL_THRESHOLD", float, 0.6),
-        "price_drop_threshold": req("PRICE_DROP_THRESHOLD", float, 0.05),
-        "smtp_host": req("SMTP_HOST", str, "127.0.0.1"),
-        "smtp_port": req("SMTP_PORT", int, 1025),
-        "smtp_user": req("SMTP_USER", str, "you@example.com"),
-        "smtp_pass": req("SMTP_PASS", str, "your_smtp_password"),
-        "smtp_from": req("SMTP_FROM", str, "you@example.com"),
-        "smtp_to": req("SMTP_TO", str, "you@example.com"),
-        "digest_mode": req("DIGEST_MODE", _parse_digest_mode, "hourly"),
-        "digest_hour_utc": req("DIGEST_HOUR_UTC", int, 7),
-        "max_deals_per_email": req("MAX_DEALS_PER_EMAIL", int, 0),  # 0 = no cap
-        "max_emails_per_day": req("MAX_EMAILS_PER_DAY", int, 4),
-        "group_by_release": req("GROUP_BY_RELEASE", _parse_bool, True),
-        "max_siblings_per_release": req("MAX_SIBLINGS_PER_RELEASE", int, 1),
-        "max_pages_per_run": req("MAX_PAGES_PER_RUN", int, 30),
-        "shipping_hints": req("SHIPPING_HINTS", _parse_bool, True),
-        "est_grams_per_vinyl": req("EST_GRAMS_PER_VINYL", int, 250),
-        "max_seller_picks": req("MAX_SELLER_PICKS", int, 5),
-        "shipping_policy_ttl_days": req("SHIPPING_POLICY_TTL_DAYS", int, 30),
-        "price_history_days": req("PRICE_HISTORY_DAYS", int, 365),
-        "price_history_min_points": req("PRICE_HISTORY_MIN_POINTS", int, 3),
+        "my_country": req("MY_COUNTRY", str),
+        "min_media_condition": req("MIN_MEDIA_CONDITION", evaluator.parse_condition),
+        "min_sleeve_condition": req("MIN_SLEEVE_CONDITION", evaluator.parse_condition),
+        "deal_threshold": req("DEAL_THRESHOLD", float),
+        "vat_rate": req("VAT_RATE", float),
+        "big_deal_threshold": req("BIG_DEAL_THRESHOLD", float),
+        "price_drop_threshold": req("PRICE_DROP_THRESHOLD", float),
+        "smtp_host": req("SMTP_HOST", str),
+        "smtp_port": req("SMTP_PORT", int),
+        "smtp_user": req("SMTP_USER", str),
+        "smtp_pass": req("SMTP_PASS", str),
+        "smtp_from": req("SMTP_FROM", str),
+        "smtp_to": req("SMTP_TO", str),
+        "digest_mode": req("DIGEST_MODE", _parse_digest_mode),
+        "digest_hour_utc": req("DIGEST_HOUR_UTC", int),
+        "max_deals_per_email": req("MAX_DEALS_PER_EMAIL", int),  # 0 = no cap
+        "max_emails_per_day": req("MAX_EMAILS_PER_DAY", int),
+        "group_by_release": req("GROUP_BY_RELEASE", _parse_bool),
+        "max_siblings_per_release": req("MAX_SIBLINGS_PER_RELEASE", int),
+        "max_pages_per_run": req("MAX_PAGES_PER_RUN", int),
+        "shipping_hints": req("SHIPPING_HINTS", _parse_bool),
+        "est_grams_per_vinyl": req("EST_GRAMS_PER_VINYL", int),
+        "max_seller_picks": req("MAX_SELLER_PICKS", int),
+        "shipping_policy_ttl_days": req("SHIPPING_POLICY_TTL_DAYS", int),
+        "price_history_days": req("PRICE_HISTORY_DAYS", int),
+        "price_history_min_points": req("PRICE_HISTORY_MIN_POINTS", int),
         # ── Optional feature toggles (unset = feature off, not a hidden default) ──
-        "seller_rating_min": _opt_int("SELLER_RATING_MIN", None),
-        "healthcheck_url": os.getenv("HEALTHCHECK_URL", "").strip() or None,
-        "discogs_token": os.getenv("DISCOGS_TOKEN", "").strip() or None,
-        "discogs_username": os.getenv("DISCOGS_USERNAME", "").strip() or None,
+        "seller_rating_min": _opt_int("SELLER_RATING_MIN"),
+        "healthcheck_url": _opt("HEALTHCHECK_URL"),
+        "discogs_token": _opt("DISCOGS_TOKEN"),
+        "discogs_username": _opt("DISCOGS_USERNAME"),
     }
 
     if missing:
-        if _dry_run:
-            logger.warning("DRY_RUN: using example values for unset .env keys: %s", ", ".join(missing))
-        else:
-            logger.error(
-                "Missing required .env config: %s — set them in .env "
-                "(see .env.example), or run with DRY_RUN=1 to use example values.",
-                ", ".join(missing),
-            )
-            sys.exit(1)
+        logger.error(
+            "Missing required .env config: %s — set them in .env (copy .env.example).",
+            ", ".join(missing),
+        )
+        sys.exit(1)
     return cfg
 
 
@@ -437,26 +434,16 @@ def main() -> None:
         to_send = pending[:cap]
         extra = len(pending) - len(to_send)
         scan_counts = {"scanned_releases": scanned_releases, "wantlist_total": wantlist_total}
-        if _dry_run:
-            from notifier import _build_html, _build_text
-            html_path = Path("/tmp/digest.html")
-            text_path = Path("/tmp/digest.txt")
-            html_path.write_text(_build_html(to_send, now, extra, session_days_left, scan_counts=scan_counts))
-            text_path.write_text(_build_text(to_send, now, extra, session_days_left, scan_counts=scan_counts))
-            logger.info("DRY_RUN: digest written to %s and %s (%d deal(s), %d extra)",
-                        html_path, text_path, len(to_send), extra)
+        notifier = EmailNotifier(
+            smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],
+            smtp_user=cfg["smtp_user"], smtp_pass=cfg["smtp_pass"],
+            smtp_from=cfg["smtp_from"], smtp_to=cfg["smtp_to"],
+        )
+        try:
+            notifier.send(to_send, now, extra_count=extra, session_days_left=session_days_left, scan_counts=scan_counts)
             flush_ok = True
-        else:
-            notifier = EmailNotifier(
-                smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],
-                smtp_user=cfg["smtp_user"], smtp_pass=cfg["smtp_pass"],
-                smtp_from=cfg["smtp_from"], smtp_to=cfg["smtp_to"],
-            )
-            try:
-                notifier.send(to_send, now, extra_count=extra, session_days_left=session_days_left, scan_counts=scan_counts)
-                flush_ok = True
-            except Exception as exc:
-                logger.error("Email send failed: %s — %d deal(s) remain pending", exc, len(pending))
+        except Exception as exc:
+            logger.error("Email send failed: %s — %d deal(s) remain pending", exc, len(pending))
         if flush_ok:
             pending = pending[len(to_send):]
             _record_email_sent(state, now)

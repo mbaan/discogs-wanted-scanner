@@ -51,7 +51,6 @@ you 14 days before expiry (and again if a run is rejected with 401/403).
 
 ```sh
 uv run python watcher.py                       # one real run; sends email
-DRY_RUN=1 uv run python watcher.py             # no SMTP; writes /tmp/digest.{html,txt}
 DEBUG=1 uv run python watcher.py               # verbose logging
 uv run pytest                                  # unit tests, no network
 ```
@@ -99,10 +98,9 @@ badge stays quiet until there's enough history to mean something.
 ## Tuning knobs (`.env`)
 
 Every var below is **required** — the watcher aborts on startup with the full
-list of anything unset (run with `DRY_RUN=1` to fall back to example values).
-Copy `.env.example` and edit. The exceptions, marked _(optional)_, are feature
-toggles whose unset state means "feature off", not a hidden default. The
-`SMTP_*` keys live in the [Email](#email) section.
+list of anything unset. Copy `.env.example` and edit. The exceptions, marked
+_(optional)_, are feature toggles whose unset state means "feature off", not a
+hidden default. The `SMTP_*` keys live in the [Email](#email) section.
 
 | Var | Example | Effect |
 |---|---|---|
