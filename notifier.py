@@ -190,6 +190,85 @@ def _sibling_text(sib: dict) -> str:
     return f"+ {_money(amt, ccy)} landed · {cond} · {seller}{extra} · {sib.get('listing_url', '')}"
 
 
+def _tier_caps(hint: dict) -> list[tuple]:
+    """[(price, cap_or_None)] — cap = records that ship at that fee. None = top tier."""
+    per = hint.get("per_item") or 1
+    caps = []
+    for tier in hint.get("tiers") or []:
+        mx, price = tier[0], tier[1]
+        caps.append((price, None if mx == 0 else max(1, int(mx // per))))
+    return caps
+
+
+def _shipping_summary(hint: dict) -> str:
+    """Compact one-line policy summary: free-shipping nudge and/or fee tiers."""
+    cur = hint.get("currency")
+    parts = []
+    if hint.get("free_shipping") and hint.get("free_min") is not None:
+        fm = _money(hint["free_min"], cur)
+        gap = hint.get("free_gap")
+        if gap and gap > 0:
+            parts.append(f"Free over {fm} — matches ≈ {_money(hint.get('subtotal'), cur)}, add {_money(gap, cur)}")
+        else:
+            parts.append(f"Free shipping over {fm}")
+    caps = _tier_caps(hint)
+    if caps:
+        segs = [(f"{_money(p, cur)} (more)" if cap is None else f"{_money(p, cur)} (≤{cap})") for p, cap in caps]
+        country = hint.get("country") or ""
+        est = " (est.)" if hint.get("basis") == "weight-est" else ""
+        parts.append(f"Ship {country}: " + ", ".join(segs) + est)
+    return " · ".join(parts)
+
+
+def _shipping_html(deal: dict) -> str:
+    hint = deal.get("shipping_hint")
+    picks = deal.get("_seller_picks") or []
+    others = deal.get("_seller_total_others") or 0
+    if not hint and not picks:
+        return ""
+    seller = _h((hint or {}).get("seller") or deal.get("seller_username") or "this seller")
+    head = f"📦 {seller}" + (f" — {others} more on your wantlist" if others else "")
+    rows = [f'<div style="margin-top:8px; font-size:13px; color:#444; font-weight:600;">{head}</div>']
+    if hint:
+        summ = _shipping_summary(hint)
+        if summ:
+            rows.append(f'<div style="font-size:12px; color:#666; margin-top:2px;">{_h(summ)}</div>')
+    for p in picks:
+        amt = _money(p.get("buyer_price"), p.get("buyer_currency"))
+        cond = condition_short(p.get("media_condition"))
+        title = _h((f'{p.get("release_artist")} – ' if p.get("release_artist") else "") + (p.get("release_title") or "?"))
+        url = _h(p.get("listing_url") or "#")
+        rows.append(
+            f'<div style="margin-top:4px; font-size:12px; color:#555;">'
+            f'+ <a href="{url}" style="color:#555;">{amt}</a> · {cond} · {title}</div>'
+        )
+    if others > len(picks):
+        rows.append(f'<div style="margin-top:2px; font-size:12px; color:#999;">+{others - len(picks)} more</div>')
+    return '<div style="margin-top:6px; padding-top:6px; border-top:1px dashed #eee;">' + "".join(rows) + "</div>"
+
+
+def _shipping_text(deal: dict) -> list[str]:
+    hint = deal.get("shipping_hint")
+    picks = deal.get("_seller_picks") or []
+    others = deal.get("_seller_total_others") or 0
+    if not hint and not picks:
+        return []
+    seller = (hint or {}).get("seller") or deal.get("seller_username") or "this seller"
+    lines = [f"📦 {seller}" + (f" — {others} more on your wantlist" if others else "")]
+    if hint:
+        summ = _shipping_summary(hint)
+        if summ:
+            lines.append("  " + summ)
+    for p in picks:
+        amt = _money(p.get("buyer_price"), p.get("buyer_currency"))
+        cond = condition_short(p.get("media_condition"))
+        title = (f'{p.get("release_artist")} – ' if p.get("release_artist") else "") + (p.get("release_title") or "?")
+        lines.append(f"  + {amt} · {cond} · {title} · {p.get('listing_url', '')}")
+    if others > len(picks):
+        lines.append(f"  +{others - len(picks)} more")
+    return lines
+
+
 def _deal_html(deal: dict) -> str:
     cert = deal.get("certainty_label", "")
     cert_color = _CERTAINTY_COLOURS.get(cert, "#555")
@@ -225,6 +304,7 @@ def _deal_html(deal: dict) -> str:
     )
 
     siblings_html = "".join(_sibling_html(s) for s in (deal.get("_siblings") or []))
+    shipping_html = _shipping_html(deal)
 
     return f"""
   <tr><td style="padding:14px 0; border-bottom:1px solid #eee; font-family:sans-serif;">
@@ -241,6 +321,7 @@ def _deal_html(deal: dict) -> str:
                     border-radius:3px; font-size:12px;">View listing →</a>
         </div>
         {siblings_html}
+        {shipping_html}
       </div>
     </div>
   </td></tr>"""
@@ -351,6 +432,7 @@ def _build_text(
         lines.append(d.get("listing_url", ""))
         for s in d.get("_siblings") or []:
             lines.append(_sibling_text(s))
+        lines.extend(_shipping_text(d))
         lines.append("-" * 60)
     if extra_count > 0:
         lines.append(f"\n+{extra_count} more deal(s) not shown.")

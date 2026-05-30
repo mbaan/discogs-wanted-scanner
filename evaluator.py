@@ -237,3 +237,42 @@ def get_shipping_region(ships_from: str | None, my_country: str) -> str:
     if sf in EU_COUNTRIES:
         return f"EU ({sf})"
     return f"International ({sf})"
+
+
+def group_by_seller(listings: list[dict], passing_only: bool = True) -> dict[int, list[dict]]:
+    """Group fetched wantlist listings by seller uid.
+
+    Every /sell_item listing is already a wantlist match, so this yields, per
+    seller, the other records of yours they have for sale — the basis for the
+    "combine to save shipping" picks. When `passing_only`, keep only listings
+    meeting the configured min condition (same gate as the rest of the digest).
+    """
+    out: dict[int, list[dict]] = {}
+    for l in listings:
+        uid = l.get("seller_uid")
+        if uid is None:
+            continue
+        if passing_only and not passes_condition(l.get("media_condition"), l.get("sleeve_condition")):
+            continue
+        out.setdefault(int(uid), []).append(l)
+    return out
+
+
+def seller_picks(seller_listings: list[dict], exclude_id: int, limit: int) -> tuple[list[dict], int]:
+    """Cheapest-first compact picks for the email, excluding the deal itself.
+
+    Returns (picks_capped_at_limit, total_other_items).
+    """
+    others = [l for l in seller_listings if l.get("id") != exclude_id]
+    others.sort(key=lambda l: float(l.get("buyer_price") or l.get("price") or 0.0))
+    picks = []
+    for l in others[:limit]:
+        picks.append({
+            "release_artist": l.get("release_artist"),
+            "release_title": l.get("release_title"),
+            "media_condition": l.get("media_condition"),
+            "buyer_price": l.get("buyer_price") or l.get("price"),
+            "buyer_currency": l.get("buyer_currency") or l.get("currency"),
+            "listing_url": l.get("listing_url"),
+        })
+    return picks, len(others)

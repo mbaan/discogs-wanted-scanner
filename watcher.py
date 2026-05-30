@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 
 import discogs_api
 import evaluator
+import shipping_policy
 import shop_api
 from notifier import EmailNotifier
 
@@ -185,6 +186,10 @@ def _load_config() -> dict:
         "healthcheck_url": os.getenv("HEALTHCHECK_URL", "").strip() or None,
         "discogs_token": os.getenv("DISCOGS_TOKEN", "").strip() or None,
         "discogs_username": os.getenv("DISCOGS_USERNAME", "").strip() or None,
+        "shipping_hints": _opt_bool("SHIPPING_HINTS", True),
+        "est_grams_per_vinyl": _opt_int("EST_GRAMS_PER_VINYL", 250),
+        "max_seller_picks": _opt_int("MAX_SELLER_PICKS", 5),
+        "shipping_policy_ttl_days": _opt_int("SHIPPING_POLICY_TTL_DAYS", 30),
     }
 
 
@@ -318,6 +323,38 @@ def _annotate_discogs_wide_median(deals: list[dict], token: str, cache: dict) ->
                 release_total, release_hits)
 
 
+def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
+    """Attach a per-seller shipping hint + 'also wanted from this seller' picks.
+
+    Reuses already-fetched wantlist listings for the picks (no extra requests);
+    the only network call is one cached v3 policy lookup per deal-seller.
+    """
+    token, country = cfg["discogs_token"], cfg["my_country"]
+    for d in deals:
+        uid = d.get("seller_uid")
+        if uid is None:
+            continue
+        listings = seller_groups.get(int(uid), [])
+        if not listings:
+            continue
+        picks, total_others = evaluator.seller_picks(listings, d.get("id"), cfg["max_seller_picks"])
+        d["_seller_picks"] = picks
+        d["_seller_total_others"] = total_others
+
+        policy = shipping_policy.get_policy(
+            uid, country, token=token, run_cache=run_cache,
+            persistent=policy_cache, ttl_days=cfg["shipping_policy_ttl_days"],
+        )
+        if policy is None:
+            continue
+        subtotal = sum(float(l.get("price") or 0.0) for l in listings)
+        hint = shipping_policy.estimate_room(policy, len(listings), subtotal, cfg["est_grams_per_vinyl"])
+        hint["seller"] = d.get("seller_username")
+        hint["country"] = country
+        hint["total_others"] = total_others
+        d["shipping_hint"] = hint
+
+
 def _deal_sort_key(d: dict) -> tuple:
     """Alphabetical by artist then title — reads naturally in the digest."""
     return (
@@ -361,6 +398,7 @@ def main() -> None:
 
     alerted = _migrate_alerted(state)
     pending: list[dict] = state.get("pending_deals") or []
+    policy_cache: dict = state.get("shipping_policies") or {}
 
     # ── Fetch listings ────────────────────────────────────────────────────────
     # listed_after=None paginates to completion so price drops on older
@@ -418,6 +456,9 @@ def main() -> None:
         len(by_release), skipped_condition, skipped_no_release,
     )
 
+    # Per-seller view of qualifying wantlist listings — basis for shipping hints.
+    seller_groups = evaluator.group_by_seller(listings, passing_only=True)
+
     # ── Evaluate each release group ──────────────────────────────────────────
     new_deals: list[dict] = []
     just_alerted: list[tuple[int, float]] = []  # (id, buyer_price)
@@ -469,6 +510,9 @@ def main() -> None:
     if cfg["group_by_release"]:
         new_deals = _group_by_release(new_deals, max_siblings=cfg["max_siblings_per_release"])
     new_deals.sort(key=_deal_sort_key)
+
+    if cfg["shipping_hints"] and cfg["discogs_token"]:
+        _annotate_shipping(new_deals, seller_groups, cfg, discogs_cache, policy_cache)
 
     for d in new_deals:
         pending.append(_strip_for_pending(d))
@@ -548,6 +592,7 @@ def main() -> None:
 
     state["alerted"] = {str(k): v for k, v in _prune_alerted(alerted).items()}
     state["pending_deals"] = pending
+    state["shipping_policies"] = policy_cache
     state["last_run"] = now.isoformat()
     _save_state(state)
 

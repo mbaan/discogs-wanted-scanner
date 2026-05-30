@@ -145,6 +145,7 @@ def parse_listing(item: dict) -> dict | None:
         "release_format": release.get("majorFormat"),
         "release_genres": genre_names,
 
+        "seller_uid": seller.get("uid"),
         "seller_username": seller.get("name"),
         "seller_rating": seller.get("rating"),
         "seller_rating_count": seller.get("ratingCount"),
