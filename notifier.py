@@ -144,25 +144,45 @@ def _heading(deal) -> str:
     return f"{head} · {cond_pair}"
 
 
-def _price_line(deal) -> str:
+def _discount_label(deal) -> str:
+    """Hero discount string: `−45%`, or `DEAL` when there's no computed discount
+    (solo listing that only fired on Discogs' own flag)."""
+    if deal.discount_pct is not None:
+        return f"−{deal.discount_pct}%"
+    return "DEAL"
+
+
+def _landed_str(deal) -> str:
+    """Landed price alone, e.g. `€52.00` — the hero figure beneath the discount."""
+    ccy = deal.landed_currency or deal.buyer_currency or deal.currency
+    return _money(deal.landed_price, ccy)
+
+
+def _price_secondary(deal) -> str:
+    """Quiet secondary line: cost breakdown + VAT + median context. The landed
+    total and the discount % now live in the hero rail, so they're omitted here."""
     item = deal.buyer_price or deal.price
     item_ccy = deal.buyer_currency or deal.currency
     ship = deal.shipping_buyer_price or deal.shipping_price or 0
-    landed_amt = deal.landed_price
     landed_ccy = deal.landed_currency or item_ccy
-    cost = (
-        f"{_money(landed_amt, landed_ccy)} landed "
-        f"({_money(item, item_ccy)} + {_money(ship, landed_ccy)} ship)"
-    )
+    breakdown = f"{_money(item, item_ccy)} + {_money(ship, landed_ccy)} ship"
     if deal.vat_estimated and deal.vat_amount:
-        cost += f" + ~{_money(deal.vat_amount, landed_ccy)} est. import VAT"
+        breakdown += f" + ~{_money(deal.vat_amount, landed_ccy)} est. import VAT"
     parts = [
-        cost,
-        deal.deal_reason,
+        breakdown,
+        _median_snippet(deal),
         _discogs_wide_snippet(deal),
         _historical_floor_snippet(deal),
     ]
     return " · ".join(p for p in parts if p)
+
+
+def _median_snippet(deal) -> str:
+    """`vs NM median €95.00` — the in-pool comparison; empty for solo/remote deals."""
+    if deal.median_value is None:
+        return ""
+    cond = condition_short(deal.media_condition)
+    return f"vs {cond} median {_money(deal.median_value, deal.median_currency)}"
 
 
 def _discogs_wide_snippet(deal) -> str:
@@ -296,37 +316,62 @@ def _shipping_text(deal) -> list[str]:
     return lines
 
 
-def _deal_html(deal) -> str:
+# Hero-rail palettes, keyed by deal depth. A 50%+ steal gets the loud red that
+# used to be the 🔥 badge; an ordinary deal gets a calm savings-green; a listing
+# that only fired on Discogs' own flag (no computed discount) gets neutral amber.
+_RAIL_BIG = ("#ffe0e0", "#f0b0b0", "#b71c1c")
+_RAIL_DEAL = ("#e8f5e9", "#b9dfbd", "#1b5e20")
+_RAIL_REMOTE = ("#fff3c4", "#f0d678", "#7a5b00")
+
+
+def _rail_html(deal) -> str:
+    """Left hero rail: big discount %, landed price, and the cover beneath."""
+    if deal.discount_pct is None:
+        bg, border, fg = _RAIL_REMOTE
+    elif deal.big_deal:
+        bg, border, fg = _RAIL_BIG
+    else:
+        bg, border, fg = _RAIL_DEAL
     img = deal.image_url
     img_html = (
-        f'<img src="{_h(img)}" alt="" width="64" height="64" '
-        f'style="display:block; border-radius:4px; object-fit:cover; flex:0 0 auto;">'
+        f'<img src="{_h(img)}" alt="" width="88" height="88" '
+        f'style="display:block; border-radius:4px; object-fit:cover; margin:10px auto 0;">'
         if img else ""
     )
+    return (
+        f'<div style="background:{bg}; border:1px solid {border}; border-radius:6px; '
+        f'padding:10px 6px; text-align:center;">'
+        f'<div style="font-size:22px; font-weight:800; color:{fg}; line-height:1; '
+        f'letter-spacing:-.02em;">{_h(_discount_label(deal))}</div>'
+        f'<div style="font-size:12px; font-weight:600; color:{fg}; margin-top:4px;">'
+        f'{_h(_landed_str(deal))}</div>'
+        f'</div>'
+        f'{img_html}'
+    )
 
-    price_line_html = _h(_price_line(deal))
 
-    if deal.big_deal:
-        price_line_html += (
-            ' <span style="background:#ffe0e0; color:#b71c1c; padding:1px 6px; '
-            'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
-            'border:1px solid #f0b0b0;">🔥 50%+</span>'
-        )
-
+def _badges_html(deal) -> str:
+    """Secondary signal chips (★ Discogs Deal, ⬇ all-time low). The 🔥 big-deal
+    badge is gone — the red rail already carries that meaning."""
+    chips = []
     if deal.is_deal_remote:
-        price_line_html += (
-            ' <span style="background:#fff3c4; color:#7a5b00; padding:1px 6px; '
-            'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
+        chips.append(
+            '<span style="background:#fff3c4; color:#7a5b00; padding:1px 6px; '
+            'border-radius:8px; font-size:11px; font-weight:600; '
             'border:1px solid #f0d678;">★ Discogs Deal</span>'
         )
-
     if deal.historical_floor_pct:
-        price_line_html += (
-            ' <span style="background:#00695c; color:#fff; padding:1px 6px; '
-            'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
+        chips.append(
+            '<span style="background:#00695c; color:#fff; padding:1px 6px; '
+            'border-radius:8px; font-size:11px; font-weight:600; '
             'border:1px solid #00897b;">⬇ All-time low</span>'
         )
+    if not chips:
+        return ""
+    return '<div style="margin-top:6px;">' + " ".join(chips) + "</div>"
 
+
+def _deal_html(deal) -> str:
     comments = (deal.comments or "").strip()
     comments_html = (
         f'<div style="margin-top:4px; font-size:12px; color:#666; font-style:italic;">'
@@ -337,14 +382,17 @@ def _deal_html(deal) -> str:
     siblings_html = "".join(_sibling_html(s) for s in (deal.siblings or []))
     shipping_html = _shipping_html(deal)
 
+    # Two-cell table (not flex): the hero rail is load-bearing, and Outlook drops
+    # flex layouts. Left = discount/landed/cover rail; right = details.
     return f"""
   <tr><td style="padding:14px 0; border-bottom:1px solid #eee; font-family:sans-serif;">
-    <div style="display:flex; gap:12px; align-items:flex-start;">
-      {img_html}
-      <div style="flex:1; min-width:0;">
+    <table style="width:100%; border-collapse:collapse;"><tr>
+      <td width="96" valign="top" style="width:96px; padding:0;">{_rail_html(deal)}</td>
+      <td valign="top" style="padding-left:14px;">
         <div style="font-size:14px; font-weight:bold;">{_h(_heading(deal))}</div>
-        <div style="font-size:13px; color:#333; margin-top:4px;">{price_line_html}</div>
+        <div style="font-size:13px; color:#666; margin-top:4px;">{_h(_price_secondary(deal))}</div>
         <div style="font-size:13px; color:#666; margin-top:2px;">{_h(_seller_line(deal))}</div>
+        {_badges_html(deal)}
         {comments_html}
         <div style="margin-top:8px;">
           <a href="{_h(deal.listing_url or "#")}"
@@ -353,8 +401,8 @@ def _deal_html(deal) -> str:
         </div>
         {siblings_html}
         {shipping_html}
-      </div>
-    </div>
+      </td>
+    </tr></table>
   </td></tr>"""
 
 
@@ -463,14 +511,19 @@ def _build_text(
     for d in deals:
         lines.append("")
         lines.append(_heading(d))
-        line = _price_line(d)
+        # Primary line mirrors the HTML hero rail: discount % + landed price,
+        # plus the signal badges (🔥 kept here since text has no rail colour).
+        primary = f"{_discount_label(d)} · {_landed_str(d)} landed"
         if d.big_deal:
-            line += " · 🔥 50%+"
+            primary += " · 🔥 50%+"
         if d.is_deal_remote:
-            line += " · ★ Discogs Deal"
+            primary += " · ★ Discogs Deal"
         if d.historical_floor_pct:
-            line += " · ⬇ all-time low"
-        lines.append(line)
+            primary += " · ⬇ all-time low"
+        lines.append(primary)
+        secondary = _price_secondary(d)
+        if secondary:
+            lines.append(secondary)
         lines.append(_seller_line(d))
         if d.comments:
             lines.append(f'"{d.comments}"')
