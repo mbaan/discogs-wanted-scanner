@@ -1,9 +1,10 @@
 # discogs-wanted-scanner
 
 Hourly cron that scans your personal Discogs **wantlist** marketplace listings,
-filters them to VG+/VG+ condition or better (vinyl *and* sleeve), evaluates how
-far each is priced below the typical landed cost for its release, and emails a
-single collected HTML digest of the good deals.
+filters them by condition (vinyl *and* sleeve must meet the `MIN_MEDIA_CONDITION`
+/ `MIN_SLEEVE_CONDITION` floors, default NM), evaluates how far each is priced
+below the typical landed cost for its release, and emails a single collected
+HTML digest of the good deals.
 
 ## How it gets the listings (no public API)
 

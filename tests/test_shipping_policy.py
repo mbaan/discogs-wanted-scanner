@@ -140,7 +140,8 @@ def test_group_by_seller_filters_condition():
         _listing(2, 100, 20.0, media="Very Good (VG)"),   # fails condition
         _listing(3, 200, 5.0),
     ]
-    groups = evaluator.group_by_seller(listings, passing_only=True)
+    vgplus = evaluator.acceptable_conditions("VG+")
+    groups = evaluator.group_by_seller(listings, vgplus, vgplus, passing_only=True)
     assert sorted(groups.keys()) == [100, 200]
     assert [l.id for l in groups[100]] == [1]
 

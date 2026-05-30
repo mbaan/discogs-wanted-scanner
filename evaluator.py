@@ -23,12 +23,6 @@ from models import Deal, Listing
 
 logger = logging.getLogger(__name__)
 
-PASSING_CONDITIONS = frozenset({
-    "Mint (M)",
-    "Near Mint (NM or M-)",
-    "Very Good Plus (VG+)",
-})
-
 EU_COUNTRIES = frozenset({
     "Austria", "Belgium", "Bulgaria", "Croatia", "Cyprus",
     "Czech Republic", "Denmark", "Estonia", "Finland", "France",
@@ -60,6 +54,10 @@ _CONDITION_SHORT = {
 }
 
 
+# Inverse of _CONDITION_SHORT, so config can name a floor by its short grade.
+_CONDITION_BY_SHORT = {short: full for full, short in _CONDITION_SHORT.items()}
+
+
 def condition_short(c: str | None) -> str:
     return _CONDITION_SHORT.get(c or "", c or "?")
 
@@ -68,9 +66,36 @@ def currency_symbol(code: str | None) -> str:
     return {"EUR": "€", "USD": "$", "GBP": "£", "JPY": "¥"}.get(code or "", (code or "") + " ")
 
 
-def passes_condition(media: str | None, sleeve: str | None) -> bool:
-    """Both vinyl AND sleeve must be VG+ or better."""
-    return (media in PASSING_CONDITIONS) and (sleeve in PASSING_CONDITIONS)
+def parse_condition(value: str) -> str:
+    """Normalize a condition given as a short grade ('NM', 'VG+') or the full
+    Discogs string ('Near Mint (NM or M-)') to its canonical full string.
+
+    Raises ValueError on anything unrecognized, so a typo'd .env floor fails loud."""
+    v = (value or "").strip()
+    if v in _CONDITION_RANK:
+        return v
+    for short, full in _CONDITION_BY_SHORT.items():
+        if short.upper() == v.upper():
+            return full
+    raise ValueError(
+        f"Unknown condition {value!r}; expected one of: "
+        + ", ".join(_CONDITION_SHORT.values())
+    )
+
+
+def acceptable_conditions(min_condition: str) -> frozenset[str]:
+    """The set of Discogs condition strings at or above `min_condition`."""
+    floor = _CONDITION_RANK[parse_condition(min_condition)]
+    return frozenset(c for c, rank in _CONDITION_RANK.items() if rank >= floor)
+
+
+def passes_condition(
+    media: str | None, sleeve: str | None,
+    media_ok: frozenset[str], sleeve_ok: frozenset[str],
+) -> bool:
+    """Vinyl must be in `media_ok` and sleeve in `sleeve_ok` (the per-floor sets
+    from `acceptable_conditions`)."""
+    return (media in media_ok) and (sleeve in sleeve_ok)
 
 
 def landed_price(listing: Listing) -> tuple[float, str]:
@@ -226,7 +251,12 @@ def get_shipping_region(ships_from: str | None, my_country: str) -> str:
     return f"International ({sf})"
 
 
-def group_by_seller(listings: list[Listing], passing_only: bool = True) -> dict[int, list[Listing]]:
+def group_by_seller(
+    listings: list[Listing],
+    media_ok: frozenset[str],
+    sleeve_ok: frozenset[str],
+    passing_only: bool = True,
+) -> dict[int, list[Listing]]:
     """Group fetched wantlist listings by seller uid.
 
     Every /sell_item listing is already a wantlist match, so this yields, per
@@ -239,7 +269,7 @@ def group_by_seller(listings: list[Listing], passing_only: bool = True) -> dict[
         uid = l.seller_uid
         if uid is None:
             continue
-        if passing_only and not passes_condition(l.media_condition, l.sleeve_condition):
+        if passing_only and not passes_condition(l.media_condition, l.sleeve_condition, media_ok, sleeve_ok):
             continue
         out.setdefault(int(uid), []).append(l)
     return out

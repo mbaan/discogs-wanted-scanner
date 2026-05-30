@@ -484,9 +484,9 @@ def _build_html(
       <table style="width:100%; border-collapse:collapse;">{rows}</table>
       {extra}
       <p style="color:#aaa; font-size:11px; margin-top:14px; border-top:1px solid #eee; padding-top:10px;">
-        Landed = item + shipping, in your account currency. Discount is vs the per-condition
-        (M / NM / VG+) median of this release's wantlist pool, measured on effective cost —
-        landed plus an estimated import VAT uplift for non-EU origins. Deals are sorted deepest-first.
+        Landed = item + shipping, in your account currency. Discount is vs the same-condition
+        median of this release's wantlist pool, measured on effective cost — landed plus an
+        estimated import VAT uplift for non-EU origins. Deals are sorted deepest-first.
       </p>
     </div>
   </div>

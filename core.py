@@ -42,11 +42,13 @@ def build_deals(
     since. `price_history` is mutated in place: today's lowest landed prices are
     folded in (after deals are annotated against prior observations)."""
     # ── Group by release, filter to qualifying conditions ────────────────────
+    media_ok = evaluator.acceptable_conditions(cfg["min_media_condition"])
+    sleeve_ok = evaluator.acceptable_conditions(cfg["min_sleeve_condition"])
     by_release: dict[int, list[Listing]] = {}
     skipped_condition = 0
     skipped_no_release = 0
     for l in listings:
-        if not evaluator.passes_condition(l.media_condition, l.sleeve_condition):
+        if not evaluator.passes_condition(l.media_condition, l.sleeve_condition, media_ok, sleeve_ok):
             skipped_condition += 1
             continue
         if l.release_id is None:
@@ -59,7 +61,7 @@ def build_deals(
     )
 
     # Per-seller view of qualifying wantlist listings — basis for shipping hints.
-    seller_groups = evaluator.group_by_seller(listings, passing_only=True)
+    seller_groups = evaluator.group_by_seller(listings, media_ok, sleeve_ok)
 
     # ── Evaluate each release group + re-alert gate ──────────────────────────
     new_deals: list[Deal] = []

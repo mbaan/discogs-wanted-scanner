@@ -1,0 +1,38 @@
+TODO — email digest redesign (scoped 2026-05-30, not started)
+=============================================================
+
+Verdict: the current digest design is already good. Ship-as-is is a valid
+outcome. Everything below is OPTIONAL polish, ranked by payoff.
+
+HIGHEST PAYOFF
+  - Promote the discount %. Today "X% below median" is buried mid price-line at
+    the same weight as the cost breakdown + badges. For a deal alert that number
+    is THE hook — give it a visual hero (left price rail or large chip) and demote
+    the breakdown + median to a quiet secondary line.
+
+MEDIUM
+  - Split the dense price line into primary (landed + discount) vs secondary
+    (item+ship breakdown, in-pool median, VAT note).
+
+LOW / OPTIONAL
+  - Larger cover thumbnail (64 -> ~88px; vinyl is the product).
+
+WHERE / HOW
+  - All work lives in notifier.py: _deal_html / _build_html / _price_line + the
+    badge/sibling/shipping helpers, and the _build_text plain-text twin.
+  - Ignore the scoping doc at: ~/.claude/plans/parallel-munching-cocke.md -- this TODO file has been manually updated to match what the user truly wants.
+
+TODO — split into python package structure for easier overview
+=============================================================
+
+Not worked out.
+
+TODO — update .env.example with defaults based on current .env
+=============================================================
+
+Not worked out. But take for example the default time zone, thresholds, etc. Should still be generic at its base, so don't copy the Proton stuff for example.
+
+TODO — make record and cover condition variable in .env config
+=============================================================
+
+TBA, but make NM the default quality requirement setting for both.

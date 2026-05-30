@@ -142,6 +142,18 @@ def _opt_bool(key: str, default: bool) -> bool:
     return default
 
 
+def _opt_condition(key: str, default: str) -> str:
+    """A media/sleeve condition floor, given as a short grade ('NM') or full
+    Discogs string. Normalized to canonical; a typo exits rather than silently
+    widening the quality bar."""
+    raw = os.getenv(key, "").strip() or default
+    try:
+        return evaluator.parse_condition(raw)
+    except ValueError as exc:
+        logger.error("Invalid %s: %s", key, exc)
+        sys.exit(1)
+
+
 def _load_config() -> dict:
     load_dotenv(_ENV_FILE)
     digest_mode = os.getenv("DIGEST_MODE", "hourly").strip().lower()
@@ -150,6 +162,8 @@ def _load_config() -> dict:
         digest_mode = "hourly"
     return {
         "my_country": os.getenv("MY_COUNTRY", "Netherlands").strip(),
+        "min_media_condition": _opt_condition("MIN_MEDIA_CONDITION", "NM"),
+        "min_sleeve_condition": _opt_condition("MIN_SLEEVE_CONDITION", "NM"),
         "deal_threshold": _opt_float("DEAL_THRESHOLD", 0.35),
         "vat_rate": _opt_float("VAT_RATE", 0.21),
         "big_deal_threshold": _opt_float("BIG_DEAL_THRESHOLD", 0.50),

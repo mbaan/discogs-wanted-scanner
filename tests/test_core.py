@@ -10,6 +10,7 @@ def _cfg(**over):
     base = dict(
         deal_threshold=0.35, my_country="Netherlands", vat_rate=0.21,
         big_deal_threshold=0.50, price_drop_threshold=0.05,
+        min_media_condition="VG+", min_sleeve_condition="VG+",
         group_by_release=True, max_siblings_per_release=1,
         price_history_min_points=3,
     )

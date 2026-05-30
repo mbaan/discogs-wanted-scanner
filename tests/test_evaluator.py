@@ -21,9 +21,22 @@ def _listing(id_, **kw):
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 def test_condition_filter_blocks_g_grade():
-    assert not evaluator.passes_condition("Good (G)", "Very Good Plus (VG+)")
-    assert not evaluator.passes_condition("Very Good Plus (VG+)", "Good (G)")
-    assert evaluator.passes_condition("Mint (M)", "Near Mint (NM or M-)")
+    vgplus = evaluator.acceptable_conditions("VG+")
+    assert not evaluator.passes_condition("Good (G)", "Very Good Plus (VG+)", vgplus, vgplus)
+    assert not evaluator.passes_condition("Very Good Plus (VG+)", "Good (G)", vgplus, vgplus)
+    assert evaluator.passes_condition("Mint (M)", "Near Mint (NM or M-)", vgplus, vgplus)
+
+
+def test_acceptable_conditions_floor():
+    nm = evaluator.acceptable_conditions("NM")
+    assert nm == {"Mint (M)", "Near Mint (NM or M-)"}  # NM floor excludes VG+
+    # Short and full forms agree; matching is case-insensitive.
+    assert evaluator.acceptable_conditions("vg+") == evaluator.acceptable_conditions("Very Good Plus (VG+)")
+
+
+def test_parse_condition_rejects_unknown():
+    with pytest.raises(ValueError):
+        evaluator.parse_condition("Excellent")
 
 
 def test_landed_price_includes_shipping():
