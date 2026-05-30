@@ -71,7 +71,7 @@ class EmailNotifier(Notifier):
         msg.attach(MIMEText(_build_html(deals, run_time, extra_count, session_days_left, scan_counts=scan_counts), "html"))
 
         self._send_message(msg)
-        logger.info("Email sent to %s (%d deal(s), %d extra)", self.smtp_to, n, extra_count)
+        logger.info("Email sent to %s (%d deal(s), %d extra)", self.smtp_to, len(deals), extra_count)
 
     def send_admin_alert(self, subject: str, body: str) -> None:
         msg = MIMEMultipart("alternative")
