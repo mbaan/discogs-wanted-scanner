@@ -61,9 +61,7 @@ class EmailNotifier(Notifier):
     ) -> None:
         if not deals:
             return
-        run_str = run_time.strftime("%Y-%m-%d %H:%M UTC")
-        n = len(deals)
-        subject = f"[Discogs Watcher] {n} good deal{'s' if n != 1 else ''} — {run_str}"
+        subject = _build_subject(deals)
 
         msg = MIMEMultipart("alternative")
         msg["Subject"] = subject
@@ -150,6 +148,23 @@ def _discount_label(deal) -> str:
     if deal.discount_pct is not None:
         return f"−{deal.discount_pct}%"
     return "DEAL"
+
+
+def _build_subject(deals: list[Deal]) -> str:
+    """Lead the subject with the strongest deal — discount, record, price — so
+    the hook survives inbox truncation. Deals arrive deepest-discount-first, so
+    `deals[0]` is the headline; remaining ones become a `+N more` tail. The
+    `[Discogs Watcher]` prefix stays put for mail filters."""
+    top = deals[0]
+    title = top.release_title or "Unknown"
+    head = f"{top.release_artist} — {title}" if top.release_artist else title
+    price = _money(top.buyer_price, top.buyer_currency)
+    lead = f"−{top.discount_pct}% off" if top.discount_pct is not None else "Deal"
+    subject = f"[Discogs Watcher] {lead}: {head} · {price}"
+    extra = len(deals) - 1
+    if extra:
+        subject += f" (+{extra} more)"
+    return subject
 
 
 def _landed_str(deal) -> str:
