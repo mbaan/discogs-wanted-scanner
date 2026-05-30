@@ -88,6 +88,13 @@ configurable fraction below it.
 A previously-alerted listing only re-alerts when its price has since dropped a
 further `PRICE_DROP_THRESHOLD` (default 5%).
 
+**All-time low.** Separately from the in-pool median, the watcher remembers the
+lowest landed price it has actually observed for each release+condition over a
+rolling window (`PRICE_HISTORY_DAYS`). When a new deal undercuts every prior
+observation — and there are at least `PRICE_HISTORY_MIN_POINTS` of them — it gets
+an **⬇ All-time low** badge. This builds up in `state.json` over time, so the
+badge stays quiet until there's enough history to mean something.
+
 ## Tuning knobs (`.env`)
 
 | Var | Default | Effect |
@@ -111,6 +118,8 @@ further `PRICE_DROP_THRESHOLD` (default 5%).
 | `EST_GRAMS_PER_VINYL` | `250` | Per-record weight estimate for weight-based shipping tiers. |
 | `MAX_SELLER_PICKS` | `5` | Max "also wanted from this seller" rows per deal. |
 | `SHIPPING_POLICY_TTL_DAYS` | `30` | How long a fetched shipping policy stays cached. |
+| `PRICE_HISTORY_DAYS` | `365` | Rolling window of observed prices kept in `state.json` for the all-time-low signal. |
+| `PRICE_HISTORY_MIN_POINTS` | `3` | Observations required before an "⬇ all-time low" badge can fire. |
 | `HEALTHCHECK_URL` | (unset) | Optional ping on each successful run (e.g. healthchecks.io). |
 
 ## Optional: Discogs PAT enrichment

@@ -159,6 +159,7 @@ def _price_line(deal: dict) -> str:
         cost,
         deal.get("deal_reason", ""),
         _discogs_wide_snippet(deal),
+        _historical_floor_snippet(deal),
     ]
     return " · ".join(p for p in parts if p)
 
@@ -171,6 +172,15 @@ def _discogs_wide_snippet(deal: dict) -> str:
     cond = condition_short(deal.get("media_condition"))
     ccy = deal.get("discogs_wide_median_currency") or deal.get("landed_currency")
     return f"Discogs-wide {cond} ≈ {_money(value, ccy)}"
+
+
+def _historical_floor_snippet(deal: dict) -> str:
+    """`all-time low (−X%, N pts)` — empty when no historical-floor annotation."""
+    pct = deal.get("historical_floor_pct")
+    if not pct:
+        return ""
+    pts = deal.get("historical_data_points")
+    return f"all-time low (−{pct}%, {pts} pts)" if pts else f"all-time low (−{pct}%)"
 
 
 def _seller_line(deal: dict) -> str:
@@ -307,6 +317,13 @@ def _deal_html(deal: dict) -> str:
             ' <span style="background:#fff3c4; color:#7a5b00; padding:1px 6px; '
             'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
             'border:1px solid #f0d678;">★ Discogs Deal</span>'
+        )
+
+    if deal.get("historical_floor_pct"):
+        price_line_html += (
+            ' <span style="background:#00695c; color:#fff; padding:1px 6px; '
+            'border-radius:8px; font-size:11px; font-weight:600; margin-left:4px; '
+            'border:1px solid #00897b;">⬇ All-time low</span>'
         )
 
     comments = (deal.get("comments") or "").strip()
@@ -450,6 +467,8 @@ def _build_text(
             line += " · 🔥 50%+"
         if d.get("is_deal_remote"):
             line += " · ★ Discogs Deal"
+        if d.get("historical_floor_pct"):
+            line += " · ⬇ all-time low"
         lines.append(line)
         lines.append(_seller_line(d))
         if d.get("comments"):

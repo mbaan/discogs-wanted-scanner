@@ -113,3 +113,98 @@ def test_deal_sort_key_alphabetical_tie_break():
     ordered = sorted([a, b], key=watcher._deal_sort_key)
     # Equal discount → alphabetical by artist.
     assert [d["id"] for d in ordered] == [2, 1]
+
+
+# ── Price history (all-time-low signal) ───────────────────────────────────────
+
+def _qlisting(release_id, condition, buyer_price, shipping=5.0):
+    return {
+        "id": release_id * 10,
+        "release_id": release_id,
+        "media_condition": condition,
+        "buyer_price": buyer_price,
+        "buyer_currency": "EUR",
+        "shipping_buyer_price": shipping,
+    }
+
+
+def test_record_price_history_creates_entry():
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    history = {}
+    watcher._record_price_history(history, [_qlisting(100, "Very Good Plus (VG+)", 20.0)], now)
+    assert history["100:Very Good Plus (VG+)"][0] == {"d": "2026-05-28", "p": 25.0, "c": "EUR"}
+
+
+def test_record_price_history_upserts_lower_price_same_day():
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    history = {}
+    listings = [
+        _qlisting(100, "Very Good Plus (VG+)", 20.0),  # 25.0 landed
+        _qlisting(100, "Very Good Plus (VG+)", 15.0),  # 20.0 landed — cheaper
+    ]
+    watcher._record_price_history(history, listings, now)
+    key = "100:Very Good Plus (VG+)"
+    assert len(history[key]) == 1
+    assert history[key][0]["p"] == 20.0
+
+
+def test_record_price_history_does_not_replace_lower_existing():
+    now = datetime(2026, 5, 28, 12, 0, tzinfo=timezone.utc)
+    history = {"100:Very Good Plus (VG+)": [{"d": "2026-05-28", "p": 18.0, "c": "EUR"}]}
+    watcher._record_price_history(history, [_qlisting(100, "Very Good Plus (VG+)", 20.0)], now)
+    assert history["100:Very Good Plus (VG+)"][0]["p"] == 18.0
+
+
+def test_prune_price_history_removes_old_entries():
+    now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+    history = {
+        "100:Very Good Plus (VG+)": [
+            {"d": "2026-02-25", "p": 15.0, "c": "EUR"},  # 92 days ago → pruned
+            {"d": "2026-05-01", "p": 18.0, "c": "EUR"},  # 27 days ago → kept
+        ]
+    }
+    watcher._prune_price_history(history, now, days=90)
+    key = "100:Very Good Plus (VG+)"
+    assert [e["d"] for e in history[key]] == ["2026-05-01"]
+
+
+def test_prune_price_history_removes_empty_keys():
+    now = datetime(2026, 5, 28, tzinfo=timezone.utc)
+    history = {"100:Very Good Plus (VG+)": [{"d": "2026-02-01", "p": 15.0, "c": "EUR"}]}
+    watcher._prune_price_history(history, now, days=90)
+    assert "100:Very Good Plus (VG+)" not in history
+
+
+def test_annotate_historical_floor_badges_new_low():
+    deal = {"release_id": 100, "media_condition": "Very Good Plus (VG+)", "landed_price": 18.0}
+    history = {
+        "100:Very Good Plus (VG+)": [
+            {"d": "2026-05-01", "p": 22.0, "c": "EUR"},
+            {"d": "2026-05-05", "p": 24.0, "c": "EUR"},
+            {"d": "2026-05-10", "p": 25.0, "c": "EUR"},
+        ]
+    }
+    watcher._annotate_historical_floor([deal], history, min_points=3)
+    assert deal["historical_floor_pct"] == 18  # int((1 - 18/22) * 100)
+    assert deal["historical_floor_value"] == 22.0
+    assert deal["historical_data_points"] == 3
+
+
+def test_annotate_historical_floor_no_badge_above_floor():
+    deal = {"release_id": 100, "media_condition": "Very Good Plus (VG+)", "landed_price": 26.0}
+    history = {
+        "100:Very Good Plus (VG+)": [
+            {"d": "2026-05-01", "p": 22.0, "c": "EUR"},
+            {"d": "2026-05-05", "p": 24.0, "c": "EUR"},
+            {"d": "2026-05-10", "p": 25.0, "c": "EUR"},
+        ]
+    }
+    watcher._annotate_historical_floor([deal], history, min_points=3)
+    assert "historical_floor_pct" not in deal
+
+
+def test_annotate_historical_floor_skips_insufficient_history():
+    deal = {"release_id": 100, "media_condition": "Very Good Plus (VG+)", "landed_price": 10.0}
+    history = {"100:Very Good Plus (VG+)": [{"d": "2026-05-01", "p": 22.0, "c": "EUR"}]}
+    watcher._annotate_historical_floor([deal], history, min_points=3)
+    assert "historical_floor_pct" not in deal

@@ -187,6 +187,8 @@ def _load_config() -> dict:
         "est_grams_per_vinyl": _opt_int("EST_GRAMS_PER_VINYL", 250),
         "max_seller_picks": _opt_int("MAX_SELLER_PICKS", 5),
         "shipping_policy_ttl_days": _opt_int("SHIPPING_POLICY_TTL_DAYS", 30),
+        "price_history_days": _opt_int("PRICE_HISTORY_DAYS", 365),
+        "price_history_min_points": _opt_int("PRICE_HISTORY_MIN_POINTS", 3),
     }
 
 
@@ -356,6 +358,66 @@ def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
         d["shipping_hint"] = hint
 
 
+# ── Historical price floor ───────────────────────────────────────────────────
+# We persist the lowest landed price we've *observed* per (release, condition)
+# in state.json, one entry per day, pruned to a rolling window. When a new deal
+# beats every prior observed low — and we have enough observations to mean it —
+# it earns an "all-time low" badge in the digest.
+
+def _record_price_history(price_history: dict, qualifying_listings: list[dict], now: datetime) -> None:
+    """Record the lowest landed price seen today per (release_id, media_condition)."""
+    today = now.date().isoformat()
+    for listing in qualifying_listings:
+        rid = listing.get("release_id")
+        cond = listing.get("media_condition")
+        if rid is None or not cond:
+            continue
+        key = f"{rid}:{cond}"
+        landed, ccy = evaluator.landed_price(listing)
+        landed = round(landed, 2)
+        entries = price_history.setdefault(key, [])
+        for entry in entries:
+            if entry["d"] == today:
+                if landed < entry["p"]:
+                    entry["p"] = landed
+                    entry["c"] = ccy
+                break
+        else:
+            entries.append({"d": today, "p": landed, "c": ccy})
+
+
+def _prune_price_history(price_history: dict, now: datetime, days: int) -> None:
+    """Drop entries older than `days` and remove keys left empty."""
+    cutoff = (now - timedelta(days=days)).date().isoformat()
+    for key in list(price_history):
+        kept = [e for e in price_history[key] if e["d"] >= cutoff]
+        if kept:
+            price_history[key] = kept
+        else:
+            del price_history[key]
+
+
+def _annotate_historical_floor(deals: list[dict], price_history: dict, min_points: int) -> None:
+    """Mutate deals in-place: badge any whose landed price beats every prior
+    observed low for its (release, condition), once we have >= min_points
+    observations. Call this BEFORE recording today's prices, so a deal isn't
+    compared against its own freshly-recorded entry."""
+    for deal in deals:
+        rid = deal.get("release_id")
+        cond = deal.get("media_condition")
+        if rid is None or not cond:
+            continue
+        history = price_history.get(f"{rid}:{cond}") or []
+        if len(history) < min_points:
+            continue
+        floor = min(e["p"] for e in history)
+        landed = deal.get("landed_price")
+        if landed is not None and landed < floor:
+            deal["historical_floor_value"] = floor
+            deal["historical_floor_pct"] = int((1.0 - landed / floor) * 100)
+            deal["historical_data_points"] = len(history)
+
+
 def _deal_sort_key(d: dict) -> tuple:
     """Deepest effective discount first; unranked (solo/flagged) deals sink to
     the bottom. Artist/title is a stable tie-break so equal-discount deals read
@@ -403,6 +465,7 @@ def main() -> None:
     alerted = _migrate_alerted(state)
     pending: list[dict] = state.get("pending_deals") or []
     policy_cache: dict = state.get("shipping_policies") or {}
+    price_history: dict = state.get("price_history") or {}
 
     # ── Fetch listings ────────────────────────────────────────────────────────
     # listed_after=None paginates to completion so price drops on older
@@ -516,6 +579,11 @@ def main() -> None:
         new_deals = _group_by_release(new_deals, max_siblings=cfg["max_siblings_per_release"])
     new_deals.sort(key=_deal_sort_key)
 
+    # Annotate against prior observations, THEN fold today's prices into history.
+    _annotate_historical_floor(new_deals, price_history, cfg["price_history_min_points"])
+    qualifying_listings = [l for group in by_release.values() for l in group]
+    _record_price_history(price_history, qualifying_listings, now)
+
     if cfg["shipping_hints"] and cfg["discogs_token"]:
         _annotate_shipping(new_deals, seller_groups, cfg, discogs_cache, policy_cache)
 
@@ -595,9 +663,11 @@ def main() -> None:
             except Exception as exc:
                 logger.debug("Healthcheck ping failed: %s", exc)
 
+    _prune_price_history(price_history, now, cfg["price_history_days"])
     state["alerted"] = {str(k): v for k, v in _prune_alerted(alerted).items()}
     state["pending_deals"] = pending
     state["shipping_policies"] = policy_cache
+    state["price_history"] = price_history
     state["last_run"] = now.isoformat()
     _save_state(state)
 
