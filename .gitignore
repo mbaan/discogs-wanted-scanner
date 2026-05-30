@@ -8,6 +8,8 @@ watcher.log
 
 # Editor / agent dirs
 .claude/
+# Local agent project context — may contain personal config; keep out of the repo
+CLAUDE.md
 
 # Python / uv
 venv/

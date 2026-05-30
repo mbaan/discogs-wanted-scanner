@@ -6,6 +6,7 @@ expiry, watcher health). The Notifier base class is the extension point for
 a future push client.
 """
 
+import base64
 import html as _html
 import logging
 import smtplib
@@ -14,10 +15,24 @@ from abc import ABC, abstractmethod
 from datetime import datetime
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from pathlib import Path
 
 from evaluator import condition_short, currency_symbol
 
 logger = logging.getLogger(__name__)
+
+# Header banner: a 680×150 JPEG embedded as a base64 data-URI <img> (not a CSS
+# background-image — ProtonMail strips those). Loaded once at import. If the
+# asset is missing we degrade to a plain text header rather than crash a run.
+_HEADER_IMG_PATH = Path(__file__).parent / "records-header-email.jpg"
+try:
+    _HEADER_IMG_DATA_URI = (
+        "data:image/jpeg;base64,"
+        + base64.b64encode(_HEADER_IMG_PATH.read_bytes()).decode()
+    )
+except OSError as exc:
+    logger.warning("Header image %s unavailable (%s) — using text-only header", _HEADER_IMG_PATH, exc)
+    _HEADER_IMG_DATA_URI = None
 
 
 class Notifier(ABC):
@@ -71,11 +86,14 @@ class EmailNotifier(Notifier):
     def _send_message(self, msg: MIMEMultipart) -> None:
         port = self.smtp_port
         try:
+            # send_message() serializes via as_bytes(), so non-ASCII content
+            # (€, em-dash, 🔥, accented seller names) is encoded correctly;
+            # sendmail()+as_string() can mangle or raise on it.
             if port == 465:
                 ctx = ssl.create_default_context()
                 with smtplib.SMTP_SSL(self.smtp_host, port, context=ctx) as s:
                     s.login(self.smtp_user, self.smtp_pass)
-                    s.sendmail(self.smtp_from, self.alert_to, msg.as_string())
+                    s.send_message(msg)
             else:
                 with smtplib.SMTP(self.smtp_host, port, timeout=30) as s:
                     s.ehlo()
@@ -83,7 +101,7 @@ class EmailNotifier(Notifier):
                         s.starttls()
                         s.ehlo()
                     s.login(self.smtp_user, self.smtp_pass)
-                    s.sendmail(self.smtp_from, self.alert_to, msg.as_string())
+                    s.send_message(msg)
         except smtplib.SMTPException as exc:
             logger.error("SMTP send failed: %s", exc)
             raise
@@ -334,7 +352,7 @@ def _session_note(days: int | None) -> tuple[str, str]:
 
 
 def _scan_summary(scan_counts: dict | None) -> str:
-    """`50 of 1800 wantlist releases for sale` — empty if counts unavailable."""
+    """`50 of 2000 wantlist releases for sale` — empty if counts unavailable."""
     if not scan_counts:
         return ""
     scanned = scan_counts.get("scanned_releases")
@@ -364,8 +382,13 @@ def _build_html(
     )
     scan_summary = _scan_summary(scan_counts)
     scan_html = (
-        f'<p style="margin:2px 0 0; color:#888; font-size:12px;">{_h(scan_summary)}</p>'
+        f'<div style="margin-top:6px; color:rgba(255,255,255,0.7); font-size:12px;">{_h(scan_summary)}</div>'
         if scan_summary else ""
+    )
+    header_img_html = (
+        f'<img src="{_HEADER_IMG_DATA_URI}" alt="" width="680" height="150" '
+        f'style="grid-row:1; grid-column:1; display:block; width:100%; height:150px; object-fit:cover;">'
+        if _HEADER_IMG_DATA_URI else ""
     )
     extra = ""
     if extra_count > 0:
@@ -377,15 +400,19 @@ def _build_html(
 <html><head><meta charset="utf-8"></head>
 <body style="background:#f0f0f0; padding:20px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;">
   <div style="max-width:680px; margin:0 auto; background:#fff;
-              border-radius:6px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,.08);">
-    <div style="background:#1a1a1a; color:#fff; padding:20px 24px;">
-      <h1 style="margin:0; font-size:22px; font-weight:600; letter-spacing:-.01em;">
-        Discogs Watcher
-      </h1>
-      <p style="margin:6px 0 0; color:#bbb; font-size:13px;">
-        {n} good deal{s} on your wantlist · {run_str}{session_html}
-      </p>
-      {scan_html}
+              border-radius:8px; overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,.08);">
+    <div style="display:grid; background:#111;">
+      {header_img_html}
+      <div style="grid-row:1; grid-column:1; align-self:stretch; padding:22px 24px 20px;
+                  background:linear-gradient(90deg,rgba(0,0,0,0.72) 0%,rgba(0,0,0,0.45) 50%,rgba(0,0,0,0.1) 100%);">
+        <div style="font-size:10px; font-weight:700; text-transform:uppercase; letter-spacing:.14em;
+                    color:rgba(255,255,255,0.7); margin-bottom:10px;">&#9673; Discogs Watcher</div>
+        <h1 style="margin:0; font-size:28px; font-weight:800; color:#fff; line-height:1.1;
+                   letter-spacing:-.02em; text-shadow:0 2px 6px rgba(0,0,0,0.5);">{n} good deal{s}</h1>
+        <p style="margin:4px 0 0; font-size:14px; color:rgba(255,255,255,0.88);">on your wantlist</p>
+        <div style="margin-top:12px; font-size:12px; color:rgba(255,255,255,0.82);">{run_str}{session_html}</div>
+        {scan_html}
+      </div>
     </div>
     <div style="padding:8px 24px 20px;">
       <table style="width:100%; border-collapse:collapse;">{rows}</table>
