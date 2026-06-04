@@ -17,6 +17,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 
+import requests
+
 from evaluator import condition_short, currency_symbol
 from models import Deal
 
@@ -106,6 +108,87 @@ class EmailNotifier(Notifier):
             raise
 
 
+# ── Push fast-lane (ntfy) ─────────────────────────────────────────────────────
+
+class NtfyNotifier(Notifier):
+    """Best-effort instant push for top-tier deals via ntfy (https://ntfy.sh).
+
+    WHY a sibling of EmailNotifier rather than a flag on it: the two channels have
+    nothing in common at the transport layer (SMTP vs one HTTP POST per deal) and
+    different bodies (a full HTML digest vs a one-line markdown push). The shared
+    contract is the Notifier.send() signature; everything else differs, so two
+    classes is cleaner than one branchy one.
+    """
+
+    def __init__(self, server: str, topic: str, token: str | None = None,
+                 priority: str | None = None, max_per_run: int = 10,
+                 timeout: float = 10.0):
+        self.server = server
+        self.topic = topic
+        self.token = token
+        self.priority = priority
+        self.max_per_run = max_per_run
+        self.timeout = timeout
+
+    def send(self, deals: list[Deal], run_time: datetime, **kwargs) -> int:
+        """POST one push per deal (capped at max_per_run). Never raises: a push is
+        a nicety, the digest is the record (see _post). `deals` is the caller's
+        already-selected, already-capped push-worthy subset. Returns the number
+        actually delivered, so the caller logs the truth rather than the attempt
+        count (a failed POST must not read as a success)."""
+        return sum(self._post(deal) for deal in deals[: self.max_per_run])
+
+    def _post(self, deal: Deal) -> bool:
+        """Publish one deal to ntfy; return True iff delivered.
+
+        Uses ntfy's JSON publish format (POST to the server root with the topic in
+        the body), NOT the per-topic header API. WHY: HTTP header values must be
+        latin-1, but our title carries a U+2212 minus sign, an ⬇ emoji, and
+        arbitrary-script artist names — all of which raise UnicodeEncodeError when
+        set as a `Title` header (requests encodes headers as latin-1). The JSON
+        body is UTF-8, so it carries any Unicode cleanly. The only header is the
+        ASCII bearer token; nothing Unicode ever rides in a header.
+        Ref: https://docs.ntfy.sh/publish/#publish-as-json"""
+        payload: dict = {
+            "topic": self.topic,
+            "title": _push_title(deal),
+            "message": _push_body(deal),
+            "markdown": True,
+        }
+        if deal.listing_url:
+            payload["click"] = deal.listing_url
+        if deal.image_url:
+            payload["icon"] = deal.image_url          # JPEG cover thumbnail
+        prio = _ntfy_priority(self.priority)
+        if prio is not None:
+            payload["priority"] = prio
+        headers = {"Authorization": f"Bearer {self.token}"} if self.token else {}
+        try:
+            resp = requests.post(self.server.rstrip("/"), json=payload,
+                                 headers=headers, timeout=self.timeout)
+            resp.raise_for_status()
+            return True
+        except Exception as exc:                      # fail-open: log, never propagate
+            logger.warning("ntfy push failed for listing %s: %s", deal.id, exc)
+            return False
+
+
+_NTFY_PRIORITY = {"min": 1, "low": 2, "default": 3, "high": 4, "max": 5, "urgent": 5}
+
+
+def _ntfy_priority(value: str | None) -> int | None:
+    """Map a configured ntfy priority to the JSON API's integer (1–5), or None to
+    omit. The header API accepted names ('high') or digits; the JSON API wants an
+    int, so translate. Unrecognised → None (omit; ntfy applies its default)."""
+    if not value:
+        return None
+    v = str(value).strip().lower()
+    if v.isdigit():
+        n = int(v)
+        return n if 1 <= n <= 5 else None
+    return _NTFY_PRIORITY.get(v)
+
+
 # ── Rendering ────────────────────────────────────────────────────────────────
 
 def _h(s: str | None) -> str:
@@ -173,6 +256,29 @@ def _discount_label(deal) -> str:
     if deal.discount_pct is not None:
         return f"−{deal.discount_pct}%"
     return "DEAL"
+
+
+def _push_title(deal) -> str:
+    """Short glanceable headline: discount leads (survives OS truncation), then
+    artist. An all-time-low deal gets a leading ⬇."""
+    head = deal.release_artist or deal.release_title or "Deal"
+    title = f"{_discount_label(deal)} · {head}"
+    if deal.historical_floor_value is not None:
+        title = f"⬇ {title}"
+    return title
+
+
+def _push_body(deal) -> str:
+    """One-glance push body. Reads fine as raw text (mobile apps don't render
+    markdown yet) AND as markdown (web app). Lines, not paragraphs."""
+    lines = [
+        f"**{_identity(deal)}**",                              # Artist — Title
+        f"{condition_short(deal.media_condition)} · "
+        f"{_discount_label(deal)} · {_landed_str(deal)} landed",
+    ]
+    if deal.historical_floor_value is not None:
+        lines.append("⬇ All-time low")
+    return "\n".join(lines)
 
 
 def _build_subject(deals: list[Deal]) -> str:
@@ -332,6 +438,56 @@ def _shipping_summary(hint: dict) -> str:
     return " · ".join(parts)
 
 
+def _basket_item_str(item: dict, ccy: str | None) -> str:
+    """`Bill Evans – Waltz for Debby (VG+, €9.00)` for one add-to-order item.
+    Prices are the basket's native (policy-currency) figures, formatted with the
+    basket currency — not buyer_price (see optimize_basket §6)."""
+    artist = item.get("release_artist")
+    title = item.get("release_title") or "?"
+    name = f"{artist} – {title}" if artist else title
+    cond = condition_short(item.get("media_condition"))
+    price = _money(item.get("price"), ccy)
+    return f"{name} ({cond}, {price})"
+
+
+def _basket_phrase(basket: dict) -> tuple[str, str]:
+    """(headline, detail) for a basket recommendation, currency-consistent in
+    basket['currency']. Used by both HTML and text renderers."""
+    ccy = basket.get("currency")
+    items = ", ".join(_basket_item_str(it, ccy) for it in basket.get("add") or [])
+    est = " (est.)" if basket.get("basis") == "weight-est" else ""
+    if basket.get("kind") == "free_crossing":
+        head = f"Combine to save {_money(basket.get('saving'), ccy)} shipping"
+        detail = (f"add {items} to reach {_money(basket.get('free_min'), ccy)} "
+                  f"→ free shipping{est}")
+        return head, detail
+    # tier_room
+    room = basket.get("room_more") or 0
+    head = f"Room for {room} more"
+    detail = (f"add {items} before shipping steps "
+              f"{_money(basket.get('fee_now'), ccy)} → {_money(basket.get('next_fee'), ccy)}{est}")
+    return head, detail
+
+
+def _basket_html(deal) -> str:
+    basket = getattr(deal, "basket", None)
+    if not basket:
+        return ""
+    head, detail = _basket_phrase(basket)
+    return (
+        f'<div style="margin-top:4px; font-size:12px; color:#1b5e20; font-weight:600;">'
+        f'🛒 {_h(head)} — <span style="font-weight:400; color:#555;">{_h(detail)}</span></div>'
+    )
+
+
+def _basket_text(deal) -> str:
+    basket = getattr(deal, "basket", None)
+    if not basket:
+        return ""
+    head, detail = _basket_phrase(basket)
+    return f"  🛒 {head}: {detail}"
+
+
 def _shipping_html(deal) -> str:
     hint = deal.shipping_hint
     picks = deal.seller_picks or []
@@ -345,6 +501,9 @@ def _shipping_html(deal) -> str:
         summ = _shipping_summary(hint)
         if summ:
             rows.append(f'<div style="font-size:12px; color:#666; margin-top:2px;">{_h(summ)}</div>')
+    basket_html = _basket_html(deal)
+    if basket_html:
+        rows.append(basket_html)
     for p in picks:
         amt = _money(p.get("buyer_price"), p.get("buyer_currency"))
         cond = condition_short(p.get("media_condition"))
@@ -371,6 +530,9 @@ def _shipping_text(deal) -> list[str]:
         summ = _shipping_summary(hint)
         if summ:
             lines.append("  " + summ)
+    basket_text = _basket_text(deal)
+    if basket_text:
+        lines.append(basket_text)
     for p in picks:
         amt = _money(p.get("buyer_price"), p.get("buyer_currency"))
         cond = condition_short(p.get("media_condition"))

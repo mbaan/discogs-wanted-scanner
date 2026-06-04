@@ -315,3 +315,182 @@ def test_build_text_new_order_and_cuts():
     assert "Discogs-wide" not in text                      # cut
     assert "vs VG+ median" not in text                     # cut
     assert "all-time low (−12%" not in text                # snippet dup gone
+
+
+# ── NtfyNotifier (push fast-lane) ────────────────────────────────────────────
+
+from notifier import NtfyNotifier
+
+
+class _FakeResp:
+    """Stub requests.Response: a no-op raise_for_status (success)."""
+
+    def raise_for_status(self):
+        return None
+
+
+def _ntfy_recorder(monkeypatch, resp=None, raises=None):
+    """Patch notifier.requests.post to record calls without any network.
+
+    Returns the `calls` list; each entry is a dict {url, data, json, headers}.
+    `resp` overrides the returned stub response; `raises` makes post() raise.
+    """
+    calls = []
+
+    def fake_post(url, data=None, json=None, headers=None, timeout=None):
+        calls.append({"url": url, "data": data, "json": json, "headers": headers or {}})
+        if raises is not None:
+            raise raises
+        return resp if resp is not None else _FakeResp()
+
+    monkeypatch.setattr(notifier.requests, "post", fake_post)
+    return calls
+
+
+def test_ntfy_posts_correct_url_and_headers(monkeypatch):
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh/", topic="discogs-deals-x",
+                     token="tok123", priority="high")
+    d = _deal(1, release_artist="Miles Davis", release_title="Kind of Blue",
+              image_url="https://img/cover.jpg", listing_url="https://x/1",
+              discount_pct=45, effective_discount=0.45,
+              media_condition="Near Mint (NM or M-)")
+    n.send([d], datetime.now(timezone.utc))
+
+    assert len(calls) == 1
+    c = calls[0]
+    # JSON publish format: POST to the server root (rstrip '/'); topic + everything
+    # Unicode rides in the body. Only the (ASCII) bearer token is a header.
+    assert c["url"] == "https://ntfy.sh"
+    p = c["json"]
+    assert p["topic"] == "discogs-deals-x"
+    assert p["title"] == notifier._push_title(d)
+    assert p["message"] == notifier._push_body(d)
+    assert p["click"] == "https://x/1"
+    assert p["icon"] == "https://img/cover.jpg"
+    assert p["markdown"] is True
+    assert p["priority"] == 4                       # "high" → 4
+    assert c["headers"]["Authorization"] == "Bearer tok123"
+    # No Unicode ever rides in a header (the latin-1 bug that broke the first run).
+    for v in c["headers"].values():
+        v.encode("latin-1")                         # must not raise
+
+
+def test_ntfy_body_is_markdown_and_plaintext_legible():
+    d = _deal(1, release_artist="Miles Davis", release_title="Kind of Blue",
+              media_condition="Near Mint (NM or M-)",
+              buyer_price=45.0, buyer_currency="EUR",
+              landed_price=52.0, landed_currency="EUR",
+              discount_pct=45, effective_discount=0.45)
+    body = notifier._push_body(d)
+    assert "Miles Davis — Kind of Blue" in body   # identity
+    assert "NM" in body                            # condition_short
+    assert "−45%" in body                          # discount label
+    assert "landed" in body                        # landed figure label
+    assert "All-time low" not in body              # no floor set on this deal
+
+
+def test_ntfy_body_shows_all_time_low_line():
+    d = _deal(1, historical_floor_value=40.0)
+    assert "All-time low" in notifier._push_body(d)
+
+
+def test_ntfy_title_leads_with_discount_then_artist():
+    d = _deal(1, release_artist="Miles Davis", discount_pct=45,
+              effective_discount=0.45)
+    assert notifier._push_title(d) == "−45% · Miles Davis"
+
+
+def test_ntfy_title_prefixes_arrow_for_all_time_low():
+    d = _deal(1, release_artist="Miles Davis", discount_pct=45,
+              effective_discount=0.45, historical_floor_value=40.0)
+    assert notifier._push_title(d) == "⬇ −45% · Miles Davis"
+
+
+def test_ntfy_omits_icon_when_no_image(monkeypatch):
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t")
+    n.send([_deal(1, image_url=None)], datetime.now(timezone.utc))
+    assert "icon" not in calls[0]["json"]
+
+
+def test_ntfy_omits_auth_when_no_token(monkeypatch):
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t", token=None)
+    n.send([_deal(1)], datetime.now(timezone.utc))
+    assert "Authorization" not in calls[0]["headers"]
+
+
+def test_ntfy_omits_priority_when_unset(monkeypatch):
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t", priority=None)
+    n.send([_deal(1)], datetime.now(timezone.utc))
+    assert "priority" not in calls[0]["json"]
+
+
+def test_ntfy_caps_at_max_per_run(monkeypatch):
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t", max_per_run=10)
+    deals = [_deal(i) for i in range(12)]
+    n.send(deals, datetime.now(timezone.utc))
+    assert len(calls) == 10
+
+
+def test_ntfy_push_failure_is_swallowed(monkeypatch):
+    # post() raises → send() returns normally, no exception escapes (fail-open).
+    _ntfy_recorder(monkeypatch, raises=RuntimeError("server down"))
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t")
+    n.send([_deal(1)], datetime.now(timezone.utc))  # must not raise
+
+
+def test_ntfy_500_is_swallowed(monkeypatch):
+    class _Resp500:
+        def raise_for_status(self):
+            raise RuntimeError("500 Server Error")
+
+    _ntfy_recorder(monkeypatch, resp=_Resp500())
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t")
+    n.send([_deal(1)], datetime.now(timezone.utc))  # must not raise
+
+
+def test_ntfy_no_deals_is_a_noop(monkeypatch):
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t")
+    n.send([], datetime.now(timezone.utc))
+    assert calls == []
+
+
+def test_ntfy_unicode_title_stays_in_json_body_not_headers(monkeypatch):
+    # Regression: the first live run died with
+    #   'latin-1' codec can't encode character '−'
+    # because the U+2212 minus in the title was set as an HTTP header; a non-Latin
+    # artist name would break it too. With the JSON format the title rides in the
+    # UTF-8 body and headers stay ASCII.
+    calls = _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t", token="tok")
+    d = _deal(1, release_artist="坂本龍一", discount_pct=45, effective_discount=0.45)
+    n.send([d], datetime.now(timezone.utc))
+    p = calls[0]["json"]
+    assert "坂本龍一" in p["title"]
+    assert "−45%" in p["title"]                     # U+2212, intact in the body
+    for v in calls[0]["headers"].values():
+        v.encode("latin-1")                         # headers must stay latin-1-safe
+
+
+def test_ntfy_send_returns_delivered_count(monkeypatch):
+    _ntfy_recorder(monkeypatch)
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t")
+    assert n.send([_deal(1), _deal(2)], datetime.now(timezone.utc)) == 2
+
+
+def test_ntfy_send_count_excludes_failures(monkeypatch):
+    _ntfy_recorder(monkeypatch, raises=RuntimeError("down"))
+    n = NtfyNotifier(server="https://ntfy.sh", topic="t")
+    assert n.send([_deal(1), _deal(2)], datetime.now(timezone.utc)) == 0
+
+
+def test_ntfy_priority_mapping():
+    assert notifier._ntfy_priority("high") == 4
+    assert notifier._ntfy_priority("5") == 5
+    assert notifier._ntfy_priority("bogus") is None
+    assert notifier._ntfy_priority(None) is None

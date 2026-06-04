@@ -51,13 +51,26 @@ you 14 days before expiry (and again if a run is rejected with 401/403).
 
 ```sh
 uv run python watcher.py                       # one real run; sends email
+uv run python watcher.py --full                # loud full run (re-surface + email + push)
 DEBUG=1 uv run python watcher.py               # verbose logging
 uv run pytest                                  # unit tests, no network
 ```
 
-State lives in `state.json` (gitignored): last-run timestamp plus the listings
-you've already been alerted on and at what price. The first run looks back one
-hour, so you don't get flooded with old listings.
+State lives in `state.db` (SQLite, gitignored): last-run timestamp plus the
+listings you've already been alerted/pushed on and at what price. The watcher
+starts from an empty `state.db` on first run and creates the schema itself
+(`state.json` is no longer used).
+
+- `uv run python watcher.py` — normal cron run.
+- `uv run python watcher.py --full` — loud full run: re-surface every current
+  deal (both the email-alerted and push dedup sets are bypassed for this run
+  only), force-refresh sold prices (TTL forced to 0), and email + push the lot —
+  capped by the usual limits (`MAX_DEALS_PER_EMAIL`, `PUSH_MAX_PER_RUN`,
+  `MAX_EMAILS_PER_DAY`). Runs against and updates the real `state.db`, so price
+  history and the dedup sets keep accumulating normally afterwards.
+
+Each run also writes `report.html` — a standalone snapshot of the current deals
+(no server, no port). Set `REPORT_HTML` to redirect it elsewhere.
 
 ## Cron
 
@@ -111,7 +124,7 @@ further `PRICE_DROP_THRESHOLD` (example 5%).
 lowest landed price it has actually observed for each release+condition over a
 rolling window (`PRICE_HISTORY_DAYS`). When a new deal undercuts every prior
 observation — and there are at least `PRICE_HISTORY_MIN_POINTS` of them — it gets
-an **⬇ All-time low** badge. This builds up in `state.json` over time, so the
+an **⬇ All-time low** badge. This builds up in `state.db` over time, so the
 badge stays quiet until there's enough history to mean something.
 
 ## Tuning knobs (`.env`)
@@ -147,7 +160,9 @@ hidden default. The `SMTP_*` keys live in the [Email](#email) section.
 | `EST_GRAMS_PER_VINYL` | `250` | Per-record weight estimate for weight-based shipping tiers. |
 | `MAX_SELLER_PICKS` | `5` | Max "also wanted from this seller" rows per deal. |
 | `SHIPPING_POLICY_TTL_DAYS` | `30` | How long a fetched shipping policy stays cached. |
-| `PRICE_HISTORY_DAYS` | `365` | Rolling window of observed prices kept in `state.json` for the all-time-low signal. |
+| `COMBINE_BASKET` | _(optional, off)_ | Active "add these to save €X shipping" recommendation per deal — which other wantlist items from the same seller cross their free-shipping threshold or fill the fee tier. Needs `SHIPPING_HINTS` + `DISCOGS_TOKEN`. |
+| `MAX_BASKET_ITEMS` | `3` | Max items a single combine-shipping suggestion may add. |
+| `PRICE_HISTORY_DAYS` | `365` | Rolling window of observed prices kept in `state.db` for the all-time-low signal. |
 | `PRICE_HISTORY_MIN_POINTS` | `3` | Observations required before an "⬇ all-time low" badge can fire. |
 | `HEALTHCHECK_URL` | _(optional)_ | Ping on each successful run (e.g. healthchecks.io). |
 
@@ -164,6 +179,27 @@ on the token's account (currency + shipping policy, at
 https://www.discogs.com/settings/seller). The account need not list anything for
 sale, but the seller profile must exist. If you'd rather not, leave
 `DISCOGS_TOKEN` unset and the watcher runs without it.
+
+## Optional: real-time push fast-lane (ntfy)
+
+Routes the strongest, SOLD-validated deals (and every all-time-low find) to an
+instant phone push via [ntfy](https://ntfy.sh) the moment they are detected,
+instead of waiting for the next email digest. It is **additive** — pushed deals
+still appear in the digest exactly as before; the email stays the system of record.
+
+Set `PUSH_ENABLED=true` and a private `NTFY_TOPIC` (any unguessable string), then
+subscribe the free ntfy mobile app to that topic. Tapping a push opens the Discogs
+listing directly. A deal pushes once and re-pushes only after a further
+`PRICE_DROP_THRESHOLD` price drop; pushes are capped at `PUSH_MAX_PER_RUN` per run.
+A `--full` run is loud on purpose — it bypasses the push dedup so every current
+push-worthy deal re-pushes (still capped at `PUSH_MAX_PER_RUN`). A push failure
+never blocks or affects the email digest.
+
+The push fires on the same cron run that detects the deal, so it beats the email by
+the digest-flush interval (up to an hour), not by minutes — tighten the cron
+interval on the Pi for a truly faster heads-up. See `.env.example` for all keys
+(`NTFY_SERVER`, `NTFY_TOKEN`, `PUSH_MIN_DISCOUNT`, `PUSH_PRIORITY`,
+`PUSH_MAX_PER_RUN`).
 
 ## Email
 

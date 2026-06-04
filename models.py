@@ -115,6 +115,7 @@ class Deal(Listing):
     sold_tier_caveat_value: float | None = None
     siblings: list[dict] = field(default_factory=list)
     shipping_hint: dict | None = None
+    basket: dict | None = None  # combine-shipping recommendation (set by orchestrator)
     seller_picks: list[dict] = field(default_factory=list)
     seller_total_others: int = 0
 

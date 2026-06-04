@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Discogs wantlist watcher — entry point. See README for setup + cron."""
 
-import json
+import argparse
 import logging
 import os
 import sys
@@ -18,14 +18,16 @@ import shipping_policy
 import shop_api
 import sold_prices
 from models import Deal
-from notifier import EmailNotifier
+from notifier import EmailNotifier, NtfyNotifier, _build_html
+from store import _PENDING_HARD_CAP, Store
 
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 _DIR = Path(__file__).parent
 _ENV_FILE = _DIR / ".env"
 _COOKIES_FILE = _DIR / "cookies.json"
-_STATE_FILE = _DIR / "state.json"
+_STATE_DB = _DIR / "state.db"
+_REPORT_FILE = _DIR / "report.html"
 
 # ── Logging ──────────────────────────────────────────────────────────────────
 
@@ -46,47 +48,11 @@ logger = logging.getLogger(__name__)
 
 # ── Constants ────────────────────────────────────────────────────────────────
 
-_ALERTED_HARD_CAP = 50_000
-_PENDING_HARD_CAP = 500
 _COOKIE_ALERT_COOLDOWN_HOURS = 24
 _SESSION_EXPIRY_WARN_DAYS = 14
 
 
-# ── State ────────────────────────────────────────────────────────────────────
-
-def _load_state() -> dict:
-    if not _STATE_FILE.exists():
-        return {}
-    try:
-        with open(_STATE_FILE) as f:
-            return json.load(f)
-    except (OSError, ValueError) as exc:
-        logger.warning("Could not read state.json (%s) — starting empty", exc)
-        return {}
-
-
-def _save_state(state: dict) -> None:
-    tmp = _STATE_FILE.with_suffix(".json.tmp")
-    with open(tmp, "w") as f:
-        json.dump(state, f, indent=2, sort_keys=True)
-    os.replace(tmp, _STATE_FILE)
-
-
-def _load_alerted(state: dict) -> dict[int, float]:
-    """state['alerted'] schema: {str(id): last_alert_price_in_buyer_currency}."""
-    raw = state.get("alerted")
-    if isinstance(raw, dict):
-        return {int(k): float(v) for k, v in raw.items() if v is not None}
-    return {}
-
-
-def _prune_alerted(alerted: dict[int, float]) -> dict[int, float]:
-    if len(alerted) <= _ALERTED_HARD_CAP:
-        return alerted
-    # Keep the most-recent (highest IDs); IDs grow monotonically at Discogs
-    keep = sorted(alerted.items(), key=lambda kv: kv[0], reverse=True)[:_ALERTED_HARD_CAP]
-    return dict(keep)
-
+# ── Timestamps ───────────────────────────────────────────────────────────────
 
 def _parse_ts(raw: str | None) -> datetime | None:
     if not raw:
@@ -96,6 +62,37 @@ def _parse_ts(raw: str | None) -> datetime | None:
     except ValueError:
         return None
     return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
+# ── Push fast-lane gating ──────────────────────────────────────────────────────
+
+def _is_push_worthy(deal, min_discount: float) -> bool:
+    """High-confidence, strong deals only. Asking-fallback / low-confidence noise
+    never pushes (the buzz must mean something). All-time-low always qualifies
+    (rarity signal); otherwise it must clear the discount floor.
+
+    - ranked excludes the remote_only lone-listing path (ranked=False).
+    - low_confidence excludes every asking-fallback verdict — only SOLD-validated
+      (below_sold_median) deals can push.
+    - historical_floor_value is not None is the all-time-low badge.
+    - otherwise effective_discount (the 0.0–1.0 fraction, NOT the rounded int
+      discount_pct) must be >= min_discount.
+    """
+    if not deal.ranked or deal.low_confidence:
+        return False
+    return (deal.historical_floor_value is not None
+            or (deal.effective_discount is not None
+                and deal.effective_discount >= min_discount))
+
+
+def _push_fresh(cur: float, prev: float | None, threshold: float) -> bool:
+    """Mirror the alerted re-alert gate (core.build_deals): a listing is fresh to
+    push when it was never pushed (prev is None / <= 0) or its price has dropped by
+    at least `threshold` from the last-pushed price. Independent of the email/alerted
+    gate so the two channels can't starve each other (see push spec §5.3)."""
+    if prev is not None and prev > 0 and cur >= prev * (1 - threshold):
+        return False
+    return True
 
 
 # ── Config ───────────────────────────────────────────────────────────────────
@@ -213,6 +210,10 @@ def _load_config() -> dict:
         "healthcheck_url": _opt("HEALTHCHECK_URL"),
         "discogs_token": _opt("DISCOGS_TOKEN"),
         "discogs_username": _opt("DISCOGS_USERNAME"),
+        # Combine-shipping basket optimizer (sub-feature of SHIPPING_HINTS):
+        # when on, compute & render a concrete "add these to save shipping" line.
+        "combine_basket": _opt_bool("COMBINE_BASKET"),
+        "max_basket_items": _opt_int("MAX_BASKET_ITEMS") or 3,
         "sold_prices": _opt_bool("SOLD_PRICES"),
         "sold_price_ttl_days": _opt_int("SOLD_PRICE_TTL_DAYS"),
         "sold_price_min_points": _opt_int("SOLD_PRICE_MIN_POINTS"),
@@ -226,6 +227,15 @@ def _load_config() -> dict:
         # Both default silently so the Pi keeps running without .env edits.
         "sold_tier_caveat_gap": _opt_float("SOLD_TIER_CAVEAT_GAP"),
         "sold_tier_caveat_min_points": _opt_int("SOLD_TIER_CAVEAT_MIN_POINTS"),
+        # ── Real-time push fast-lane (ntfy) — optional feature toggle ──
+        "push_enabled": _opt_bool("PUSH_ENABLED"),
+        "push_channel": _opt("PUSH_CHANNEL"),
+        "ntfy_server": _opt("NTFY_SERVER"),
+        "ntfy_topic": _opt("NTFY_TOPIC"),
+        "ntfy_token": _opt("NTFY_TOKEN"),
+        "push_min_discount": _opt_float("PUSH_MIN_DISCOUNT"),
+        "push_priority": _opt("PUSH_PRIORITY"),
+        "push_max_per_run": _opt_int("PUSH_MAX_PER_RUN"),
     }
 
     # The TTL is the one knob that matters when sold-prices is on — keep the
@@ -254,6 +264,24 @@ def _load_config() -> dict:
     if cfg["asking_min_points"] is None:
         cfg["asking_min_points"] = 5
 
+    # ── Push fast-lane: default the channel first, then enforce NTFY_TOPIC and
+    # apply the remaining silent defaults (same pattern as the sold-price knobs). ──
+    if cfg["push_enabled"]:
+        if cfg["push_channel"] is None:
+            cfg["push_channel"] = "ntfy"
+        if cfg["ntfy_server"] is None:
+            cfg["ntfy_server"] = "https://ntfy.sh"
+        if cfg["push_min_discount"] is None:
+            cfg["push_min_discount"] = 0.30
+        if cfg["push_max_per_run"] is None:
+            cfg["push_max_per_run"] = 10
+        if cfg["push_channel"] == "ntfy" and not cfg["ntfy_topic"]:
+            missing.append("NTFY_TOPIC")
+        elif cfg["push_channel"] != "ntfy":
+            logger.warning("Unsupported PUSH_CHANNEL=%r — push disabled this run",
+                           cfg["push_channel"])
+            cfg["push_enabled"] = False
+
     if missing:
         logger.error(
             "Missing required .env config: %s — set them in .env (copy .env.example).",
@@ -265,7 +293,7 @@ def _load_config() -> dict:
 
 # ── Cookie-expiry pre-check ──────────────────────────────────────────────────
 
-def _check_session_health(state: dict, cfg: dict, now: datetime) -> None:
+def _check_session_health(store, cfg: dict, now: datetime) -> None:
     try:
         cookies = shop_api._load_cookies(_COOKIES_FILE)
     except FileNotFoundError:
@@ -283,7 +311,7 @@ def _check_session_health(state: dict, cfg: dict, now: datetime) -> None:
     else:
         msg = f"session cookie expires in {days_left:.0f} day(s) ({exp.isoformat()})"
     _maybe_send_admin_alert(
-        state, cfg, now,
+        store, cfg, now,
         key="session_expiry_alert_sent_at",
         subject="Session cookie expiring soon",
         body=(
@@ -295,8 +323,8 @@ def _check_session_health(state: dict, cfg: dict, now: datetime) -> None:
     )
 
 
-def _maybe_send_admin_alert(state, cfg, now, key, subject, body):
-    last = _parse_ts(state.get(key))
+def _maybe_send_admin_alert(store, cfg, now, key, subject, body):
+    last = _parse_ts(store.get_meta(key))
     if last and (now - last) < timedelta(hours=_COOKIE_ALERT_COOLDOWN_HOURS):
         logger.info("Admin alert '%s' already sent within %dh — suppressing",
                     subject, _COOKIE_ALERT_COOLDOWN_HOURS)
@@ -308,7 +336,7 @@ def _maybe_send_admin_alert(state, cfg, now, key, subject, body):
     )
     try:
         notifier.send_admin_alert(subject, body)
-        state[key] = now.isoformat()
+        store.set_meta(key, now.isoformat())
     except Exception as exc:
         logger.error("Admin alert send failed (%s): %s", subject, exc)
 
@@ -345,9 +373,16 @@ def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
         hint["country"] = country
         hint["total_others"] = total_others
         d.shipping_hint = hint
+        if cfg["combine_basket"]:
+            d.basket = shipping_policy.optimize_basket(
+                policy, listings, d,
+                est_grams=cfg["est_grams_per_vinyl"],
+                max_add=cfg["max_basket_items"],
+            )
 
 
-def _fetch_sold_for_releases(listings, cookies_path, run_cache, sell_history_cache, cfg):
+def _fetch_sold_for_releases(listings, cookies_path, run_cache, sell_history_cache, cfg,
+                             *, sold_ttl_days=None):
     """Fetch the per-condition SOLD benchmark (sell/history) for every distinct
     release with at least one condition-passing listing — BEFORE evaluation, so the
     sold median can *lead* the verdict (`evaluator._sold_leads`). Returns
@@ -378,7 +413,8 @@ def _fetch_sold_for_releases(listings, cookies_path, run_cache, sell_history_cac
     for rid in sorted(rids):
         stats = sold_prices.get_sell_history(
             rid, session=session, run_cache=run_cache,
-            persistent=sell_history_cache, ttl_days=cfg["sold_price_ttl_days"],
+            persistent=sell_history_cache,
+            ttl_days=cfg["sold_price_ttl_days"] if sold_ttl_days is None else sold_ttl_days,
         )
         if stats:
             hit += 1
@@ -389,34 +425,101 @@ def _fetch_sold_for_releases(listings, cookies_path, run_cache, sell_history_cac
 
 # ── Pending / digest helpers ─────────────────────────────────────────────────
 
-def _emails_today(state: dict, now: datetime) -> int:
-    daily = state.get("emails_today") or {}
+def _emails_today(store, now: datetime) -> int:
+    daily = store.load_emails_today()
     return int(daily.get("count") or 0) if daily.get("date") == now.date().isoformat() else 0
 
 
-def _record_email_sent(state: dict, now: datetime) -> None:
+def _record_email_sent(store, now: datetime) -> None:
     today = now.date().isoformat()
-    daily = state.get("emails_today") or {}
-    state["emails_today"] = (
+    daily = store.load_emails_today()
+    store.save_emails_today(
         {"date": today, "count": int(daily.get("count") or 0) + 1}
         if daily.get("date") == today else {"date": today, "count": 1}
     )
 
 
+def _write_report(path, deals, now, *, extra_count, session_days_left, scan_counts) -> None:
+    """Render the current run's deals to a standalone HTML snapshot using the same
+    notifier._build_html renderer as the digest email. Latest-only, overwritten
+    each run, atomic tmp + os.replace (same pattern as the old _save_state). An
+    empty list renders a '0 good deals' placeholder so a stale report never
+    misleads. Fail-open: a write error logs and is swallowed (the report is a
+    convenience, never load-bearing)."""
+    try:
+        html = _build_html(deals, now, extra_count,
+                            session_days_left=session_days_left, scan_counts=scan_counts)
+        tmp = Path(path).with_suffix(".html.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(html)
+        os.replace(tmp, path)
+    except Exception as exc:
+        logger.warning("Could not write HTML report %s: %s", path, exc)
+
+
+def _report_path():
+    """Where the static HTML report lands. Always written (cheap, Pi-safe);
+    REPORT_HTML, when set, redirects to a custom path (the existing optional
+    feature-toggle convention — unset = default report.html, never disabled)."""
+    override = _opt("REPORT_HTML")
+    return Path(override) if override else _REPORT_FILE
+
+
+# ── CLI ──────────────────────────────────────────────────────────────────────
+
+def _parse_args(argv=None) -> argparse.Namespace:
+    """--full: a LOUD FULL RUN against the real state.db — re-surface every
+    current deal (bypass the alerted + pushed dedup), force-refetch sold data,
+    and email + push the lot (capped by the usual limits). Persists normally."""
+    parser = argparse.ArgumentParser(description="Discogs wantlist watcher")
+    parser.add_argument(
+        "--full", action="store_true",
+        help="Loud full run: re-surface every current deal, force-refresh sold "
+             "prices, and email + push the lot (capped by the usual limits)",
+    )
+    return parser.parse_args(argv)
+
+
+def _prev_alerted_for(args: argparse.Namespace, alerted: dict) -> dict:
+    """--full bypasses the re-alert gate for this run only: build_digest sees an
+    empty dict so prev_alerted.get(id) is always None (every qualifying deal
+    surfaces). The real alerted dict is still loaded + updated afterwards, so
+    normal runs resume deduping."""
+    return {} if args.full else alerted
+
+
+def _prev_pushed_for(args: argparse.Namespace, pushed: dict) -> dict:
+    """--full bypasses the push dedup the same way prev_alerted is bypassed: the
+    push fast-lane sees an empty map so _push_fresh always returns True and every
+    push-worthy deal re-pushes (capped by PUSH_MAX_PER_RUN). The real pushed dict
+    is still updated + persisted afterwards, so normal runs resume deduping."""
+    return {} if args.full else pushed
+
+
+def _sold_ttl_for(args: argparse.Namespace, ttl_days):
+    """--full force-refetches sold history by forcing an effective TTL of 0
+    (sold_prices._fresh(ts, 0) is always False); the fresh result is still
+    written back to the persistent cache normally."""
+    return 0 if args.full else ttl_days
+
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def main(args: argparse.Namespace | None = None) -> None:
+    if args is None:
+        args = _parse_args()
     cfg = _load_config()
     now = datetime.now(tz=timezone.utc)
-    state = _load_state()
+    store = Store.open(_STATE_DB)
 
-    _check_session_health(state, cfg, now)
+    _check_session_health(store, cfg, now)
 
-    alerted = _load_alerted(state)
-    pending: list[Deal] = [Deal.from_pending(d) for d in (state.get("pending_deals") or [])]
-    policy_cache: dict = state.get("shipping_policies") or {}
-    sell_history_cache: dict = state.get("sell_history") or {}
-    price_history: dict = state.get("price_history") or {}
+    alerted = store.load_alerted()
+    pushed = store.load_pushed()
+    pending: list[Deal] = [Deal.from_pending(d) for d in store.load_pending()]
+    policy_cache: dict = store.load_shipping_policies()
+    sell_history_cache: dict = store.load_sell_history()
+    price_history: dict = store.load_price_history()
 
     # ── Fetch listings ────────────────────────────────────────────────────────
     # listed_after=None paginates to completion so price drops on older
@@ -435,7 +538,7 @@ def main() -> None:
 
     if fetch_result.cookie_invalid:
         _maybe_send_admin_alert(
-            state, cfg, now,
+            store, cfg, now,
             key="cookie_alert_sent_at",
             subject="Session cookies rejected",
             body=(
@@ -444,11 +547,11 @@ def main() -> None:
                 "The watcher will run but find nothing until you do."
             ),
         )
-        _save_state(state)
+        store.close()
         sys.exit(0)
 
     # Clear stale 401-alert flag once auth works again
-    state.pop("cookie_alert_sent_at", None)
+    store.set_meta("cookie_alert_sent_at", None)
 
     listings = fetch_result.listings
     logger.info(
@@ -463,10 +566,13 @@ def main() -> None:
     if cfg["sold_prices"]:
         sold_stats_by_release = _fetch_sold_for_releases(
             listings, _COOKIES_FILE, sold_run_cache, sell_history_cache, cfg,
+            sold_ttl_days=_sold_ttl_for(args, cfg["sold_price_ttl_days"]),
         )
 
     # ── Build deals (pure pipeline: filter → evaluate → group → sort → sold-annotate) ──
-    result = core.build_digest(listings, alerted, price_history, cfg, now, sold_stats_by_release)
+    result = core.build_digest(
+        listings, _prev_alerted_for(args, alerted), price_history, cfg, now, sold_stats_by_release,
+    )
     new_deals = result.deals
     just_alerted = result.just_alerted
     seller_groups = result.seller_groups
@@ -498,10 +604,39 @@ def main() -> None:
         pending = pending[-_PENDING_HARD_CAP:]
         logger.warning("Pending exceeded cap; dropped %d oldest", dropped)
 
+    # ── Real-time push fast-lane (best-effort; additive to the digest) ──────────
+    # Fire BEFORE the flush decision so a top-tier find pings now, not at the next
+    # digest. Wrapped whole so a push outage can never block or crash the run.
+    # On a --full run the push dedup is bypassed (prev_pushed={}, mirroring the
+    # email re-alert bypass) so the whole re-surfaced set re-pushes, capped by
+    # PUSH_MAX_PER_RUN — a loud full run buzzes the phone on purpose.
+    if cfg["push_enabled"]:
+        try:
+            prev_pushed = _prev_pushed_for(args, pushed)
+            candidates = [d for d in new_deals
+                          if _is_push_worthy(d, cfg["push_min_discount"])]
+            fresh = []
+            for d in candidates:
+                cur = float(d.buyer_price or d.price or 0.0)
+                if _push_fresh(cur, prev_pushed.get(d.id), cfg["price_drop_threshold"]):
+                    fresh.append(d)
+                    pushed[d.id] = cur
+            if fresh:
+                push = NtfyNotifier(
+                    server=cfg["ntfy_server"], topic=cfg["ntfy_topic"],
+                    token=cfg["ntfy_token"], priority=cfg["push_priority"],
+                    max_per_run=cfg["push_max_per_run"],
+                )
+                delivered = push.send(fresh, now)   # caps at max_per_run internally
+                logger.info("Push fast-lane: %d of %d top-tier deal(s) delivered via ntfy",
+                            delivered, min(len(fresh), cfg["push_max_per_run"]))
+        except Exception as exc:
+            logger.error("Push fast-lane failed (%s) — continuing; digest unaffected", exc)
+
     # ── Decide whether to flush ──────────────────────────────────────────────
     should_flush = core.should_flush(len(pending), cfg["digest_mode"], now, cfg["digest_hour_utc"])
 
-    sent_today = _emails_today(state, now)
+    sent_today = _emails_today(store, now)
     if should_flush and sent_today >= cfg["max_emails_per_day"]:
         logger.warning("Email cap reached today (%d/%d) — deferring %d deal(s)",
                        sent_today, cfg["max_emails_per_day"], len(pending))
@@ -533,7 +668,7 @@ def main() -> None:
             logger.error("Email send failed: %s — %d deal(s) remain pending", exc, len(pending))
         if flush_ok:
             pending = pending[len(to_send):]
-            _record_email_sent(state, now)
+            _record_email_sent(store, now)
     elif not pending:
         logger.info("No pending deals to send")
     else:
@@ -544,9 +679,20 @@ def main() -> None:
     for lid, price in just_alerted:
         alerted[lid] = price
 
+    # ── Static HTML report (always written; latest-only snapshot) ─────────────
+    _report_cap = cfg["max_deals_per_email"] or len(pending)  # 0 = no cap
+    _report_deals = pending[:_report_cap]
+    _report_extra = len(pending) - len(_report_deals)
+    _report_scan = {"scanned_releases": scanned_releases, "wantlist_total": wantlist_total}
+    _write_report(
+        _report_path(), _report_deals, now,
+        extra_count=_report_extra, session_days_left=session_days_left,
+        scan_counts=_report_scan,
+    )
+
     # ── Persist + heartbeat ──────────────────────────────────────────────────
     if fetch_result.complete:
-        state["last_successful_run"] = now.isoformat()
+        store.set_meta("last_successful_run", now.isoformat())
         if cfg["healthcheck_url"]:
             try:
                 requests.get(cfg["healthcheck_url"], timeout=5)
@@ -554,19 +700,20 @@ def main() -> None:
                 logger.debug("Healthcheck ping failed: %s", exc)
 
     core.prune_price_history(price_history, now, cfg["price_history_days"])
-    state["alerted"] = {str(k): v for k, v in _prune_alerted(alerted).items()}
-    state["pending_deals"] = [d.to_pending() for d in pending]
-    state["shipping_policies"] = policy_cache
-    state["sell_history"] = sell_history_cache
-    state["price_history"] = price_history
-    state["last_run"] = now.isoformat()
-    _save_state(state)
+    store.save_alerted(alerted)              # _ALERTED_HARD_CAP applied inside
+    store.save_pushed(pushed)                # push fast-lane dedup set (same cap)
+    store.save_pending([d.to_pending() for d in pending])  # _PENDING_HARD_CAP inside
+    store.save_shipping_policies(policy_cache)
+    store.save_sell_history(sell_history_cache)
+    store.save_price_history(price_history)
+    store.set_meta("last_run", now.isoformat())
 
     logger.info(
         "Done. fetched=%d evaluated_deals=%d pending=%d alerted_total=%d emails_today=%d",
         len(listings), len(new_deals), len(pending), len(alerted),
-        _emails_today(state, now),
+        _emails_today(store, now),
     )
+    store.close()
 
 
 if __name__ == "__main__":

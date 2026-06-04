@@ -197,3 +197,161 @@ def estimate_room(policy: dict, n_items: int, subtotal: float, est_grams: int) -
         out["tiers"] = tiers
 
     return out
+
+
+# ── Combine-shipping basket optimizer ─────────────────────────────────────────
+
+def _listing_native_price(l) -> float:
+    """The threshold-relevant native price (policy currency). Falls back to
+    buyer_price only when the native price is missing/zero (fail-open).
+
+    The free-shipping threshold (`free_min`) and the tier prices are expressed in
+    the policy's native currency, and `watcher._annotate_shipping` already feeds
+    `estimate_room` a native-currency subtotal, so the basket math must compare
+    candidates on the *same* scale — native `l.price`, never `buyer_price`."""
+    price = getattr(l, "price", None)
+    if price:
+        return float(price)
+    return float(getattr(l, "buyer_price", 0.0) or 0.0)
+
+
+def _item_dict(l, currency: str | None) -> dict:
+    """An 'add to the order' item, mirroring seller_picks' shape but carrying the
+    NATIVE price (policy currency) the threshold math is done in (§6). Deliberately
+    NOT buyer_price: the basket line's figures are the threshold-relevant native
+    ones, labelled in the policy currency so symbols stay self-consistent."""
+    return {
+        "release_artist": getattr(l, "release_artist", None),
+        "release_title": getattr(l, "release_title", None),
+        "media_condition": getattr(l, "media_condition", None),
+        "price": _listing_native_price(l),
+        "currency": currency,
+        "listing_url": getattr(l, "listing_url", "") or "",
+    }
+
+
+def _solo_fee(policy: dict, deal_price: float, est_grams: int) -> float | None:
+    """The shipping fee for buying the deal ALONE (1-item basket) — the baseline
+    the saving is framed against (the natural "do nothing" cost). Reuses
+    estimate_room; None when the policy carries no tiers."""
+    solo = estimate_room(policy, 1, deal_price, est_grams)
+    return solo.get("fee_now")
+
+
+def optimize_basket(
+    policy: dict,
+    seller_listings: list,
+    deal,
+    *,
+    est_grams: int,
+    max_add: int,
+) -> dict | None:
+    """Recommend other condition-passing wantlist items from THIS seller to add
+    to the order, and the shipping it saves vs. buying `deal` alone.
+
+    Pure: consumes only the already-fetched seller listings + the normalized
+    policy (same inputs estimate_room gets) — no IO, no network. Returns None when
+    there's nothing actionable (no policy, single-item seller, no free threshold
+    and no usable tiers, free shipping already met, free threshold unreachable
+    within max_add, or tier room == 0). Never raises for normal data (fail-open).
+
+    Free-shipping crossing takes precedence over tier room — a free threshold is
+    the bigger, cleaner win. `est_grams` ballparks per-record weight for weight
+    tiers (flagged via basis="weight-est"); `max_add` caps the suggestion size.
+    """
+    if not policy:
+        return None
+
+    currency = policy.get("currency")
+    # Candidates: every OTHER passing listing from this seller, cheapest-first by
+    # native price (the currency the policy/tiers are in). Greedy over this small
+    # set is sufficient — a seller carries only a handful of the user's wantlist.
+    others = sorted(
+        [l for l in seller_listings if getattr(l, "id", None) != getattr(deal, "id", None)],
+        key=_listing_native_price,
+    )
+    if not others:
+        return None
+
+    deal_price = _listing_native_price(deal)
+
+    # ── Free-shipping crossing (takes precedence) ────────────────────────────
+    free_min = policy.get("free_min")
+    if policy.get("free_shipping") and free_min is not None:
+        free_min = float(free_min)
+        if deal_price >= free_min:
+            return None  # already ships free solo — nothing to add
+        if max_add >= 1:
+            add = _crossing_basket(others, deal_price, free_min, max_add)
+            if add is None:
+                # Not reachable within max_add / available candidates: emit
+                # nothing, never imply a saving that won't materialize.
+                return None
+            fee_before = _solo_fee(policy, deal_price, est_grams) or 0.0
+            return {
+                "kind": "free_crossing",
+                "currency": currency,
+                "add": [_item_dict(x, currency) for x in add],
+                "new_subtotal": deal_price + sum(_listing_native_price(x) for x in add),
+                "free_min": free_min,
+                "fee_before": fee_before,
+                "fee_after": 0.0,
+                "saving": fee_before,
+                "reachable": True,
+                "basis": estimate_room(policy, 1, deal_price, est_grams).get("basis"),
+            }
+        return None
+
+    # ── Tier room (no free threshold to cross) ───────────────────────────────
+    return _tier_room_basket(policy, others, deal_price, est_grams, max_add, currency)
+
+
+def _crossing_basket(others, deal_price, free_min, max_add) -> list | None:
+    """The basket of <= max_add cheapest-first candidates that crosses free_min,
+    or None when nothing within the cap reaches it.
+
+    Greedy cheapest-first accumulation is the primary strategy (the cheapest combo
+    that crosses). When that can't cross within the cap — e.g. max_add=1 and the
+    two cheapest items each fall short — fall back to the single cheapest item that
+    alone crosses, so a lone qualifying item is still surfaced rather than dropped."""
+    add: list = []
+    subtotal = deal_price
+    for l in others:
+        if len(add) >= max_add:
+            break
+        add.append(l)
+        subtotal += _listing_native_price(l)
+        if subtotal >= free_min:
+            return add
+    # Greedy didn't cross within the cap: accept the cheapest single item that does
+    # on its own (handles max_add=1 where a pricier-but-sufficient item exists).
+    for l in others:
+        if deal_price + _listing_native_price(l) >= free_min:
+            return [l]
+    return None
+
+
+def _tier_room_basket(policy, others, deal_price, est_grams, max_add, currency) -> dict | None:
+    """Reframe estimate_room's room_more/next_fee with concrete cheapest picks.
+
+    Emit only when there's real room (positive int room_more) AND a next tier to
+    stay below (next_fee present). At the top tier room_more is None; at the tier
+    edge it's 0 — both non-actionable -> None."""
+    solo = estimate_room(policy, 1, deal_price, est_grams)
+    room_more = solo.get("room_more")
+    next_fee = solo.get("next_fee")
+    if not isinstance(room_more, int) or room_more <= 0 or next_fee is None:
+        return None
+    take = min(room_more, max_add, len(others))
+    if take <= 0:
+        return None
+    add = others[:take]
+    return {
+        "kind": "tier_room",
+        "currency": currency,
+        "add": [_item_dict(x, currency) for x in add],
+        "room_more": room_more,
+        "fee_now": solo.get("fee_now"),
+        "next_fee": next_fee,
+        "basis": solo.get("basis"),
+    }
