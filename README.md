@@ -2,7 +2,7 @@
 
 Hourly cron that scans your personal Discogs **wantlist** marketplace listings,
 filters them by condition (vinyl *and* sleeve must meet the `MIN_MEDIA_CONDITION`
-/ `MIN_SLEEVE_CONDITION` floors, default NM), evaluates how far each is priced
+/ `MIN_SLEEVE_CONDITION` floors set in `.env`), evaluates how far each is priced
 below the typical landed cost for its release, and emails a single collected
 HTML digest of the good deals.
 
@@ -84,8 +84,8 @@ If your `uv` lives elsewhere, run `which uv` and substitute that path.
 
 ## What counts as a deal
 
-For each release on your wantlist with listings in qualifying condition
-(Mint / Near Mint / VG+, both media and sleeve), the watcher evaluates each
+For each release on your wantlist with listings clearing both configured
+condition floors (media *and* sleeve), the watcher evaluates each
 condition bucket against real sold prices (when available) or the asking median
 (as a low-confidence fallback).
 
@@ -138,7 +138,7 @@ hidden default. The `SMTP_*` keys live in the [Email](#email) section.
 |---|---|---|
 | `MY_COUNTRY` | `Germany` | Your country — classifies shipping as domestic / EU / international and drives the VAT estimate. |
 | `MIN_MEDIA_CONDITION` | `NM` | Minimum vinyl grade kept (`M`/`NM`/`VG+`/… or the full Discogs string). |
-| `MIN_SLEEVE_CONDITION` | `NM` | Minimum sleeve grade kept. Both media *and* sleeve must clear their floor. |
+| `MIN_SLEEVE_CONDITION` | `VG+` | Minimum sleeve grade kept. Both media *and* sleeve must clear their floor. |
 | `SOLD_DEAL_PERCENTILE` | `20` | SOLD path: a listing is a deal when its item price is at or below this percentile of real sold prices (cheaper than most recent buyers paid). Self-calibrating per release. |
 | `SOLD_DEAL_MIN_DISCOUNT` | `0.05` | SOLD path: materiality floor — must still be this fraction below the sold median so trivially-tight markets don't alert. |
 | `ASKING_DATA_DEAL_THRESHOLD` | `0.35` | ASKING path (low-confidence fallback): fraction below the asking median required to qualify. Steeper than the sold bar because asking prices are aspirational. |
@@ -148,11 +148,11 @@ hidden default. The `SMTP_*` keys live in the [Email](#email) section.
 | `PRICE_DROP_THRESHOLD` | `0.05` | Re-alert when a seen listing's price drops this much further. |
 | `SELLER_RATING_MIN` | _(optional)_ | Only fetch listings from sellers with ≥ this rating (0–100). |
 | `DIGEST_MODE` | `hourly` | `daily` accumulates and emails once at `DIGEST_HOUR_UTC`. |
-| `DIGEST_HOUR_UTC` | `7` | Hour (UTC) to flush when `DIGEST_MODE=daily`. |
+| `DIGEST_HOUR_UTC` | `9` | Hour (UTC) to flush when `DIGEST_MODE=daily`. |
 | `GROUP_BY_RELEASE` | `true` | Collapse multiple sellers per release into primary + siblings. |
 | `MAX_SIBLINGS_PER_RELEASE` | `1` | Runner-up listings shown per release (primary + N). |
 | `MAX_DEALS_PER_EMAIL` | `0` | `0` = no cap. |
-| `MAX_EMAILS_PER_DAY` | `4` | Safety brake against runaway alerting. |
+| `MAX_EMAILS_PER_DAY` | `10` | Safety brake against runaway alerting. |
 | `MAX_PAGES_PER_RUN` | `30` | Pagination cap on `/sell_item`. |
 | `DISCOGS_TOKEN` | _(optional)_ | PAT — enables per-deal shipping hints (see below). |
 | `DISCOGS_USERNAME` | _(optional)_ | With `DISCOGS_TOKEN`, adds an "X of Y wantlist releases for sale" summary. |
@@ -182,7 +182,8 @@ sale, but the seller profile must exist. If you'd rather not, leave
 
 ## Optional: real-time push fast-lane (ntfy)
 
-Routes the strongest, SOLD-validated deals (and every all-time-low find) to an
+Routes the strongest, SOLD-validated deals (among them, an all-time-low find
+qualifies regardless of its discount) to an
 instant phone push via [ntfy](https://ntfy.sh) the moment they are detected,
 instead of waiting for the next email digest. It is **additive** — pushed deals
 still appear in the digest exactly as before; the email stays the system of record.
@@ -198,8 +199,8 @@ never blocks or affects the email digest.
 The push fires on the same cron run that detects the deal, so it beats the email by
 the digest-flush interval (up to an hour), not by minutes — tighten the cron
 interval on the Pi for a truly faster heads-up. See `.env.example` for all keys
-(`NTFY_SERVER`, `NTFY_TOKEN`, `PUSH_MIN_DISCOUNT`, `PUSH_PRIORITY`,
-`PUSH_MAX_PER_RUN`).
+(`PUSH_CHANNEL`, `NTFY_SERVER`, `NTFY_TOKEN`, `PUSH_MIN_DISCOUNT`,
+`PUSH_PRIORITY`, `PUSH_MAX_PER_RUN`).
 
 ## Email
 
@@ -217,8 +218,10 @@ core.py           pure deal pipeline: filter → evaluate → group → sort →
 models.py         Listing + Deal dataclasses — the typed data surface
 evaluator.py      condition filter, effective-cost median, VAT, shipping region
 shop_api.py       internal /sell_item client + cookie session auth
-discogs_api.py    official PAT API (price suggestions, wantlist size)
+sold_prices.py    sell/history scrape → per-condition SOLD benchmark
+discogs_api.py    official PAT API (wantlist size; shared 1/s + 429 backoff)
 shipping_policy.py  v3 shipping-policy fetch + landed-room estimate
-notifier.py       EmailNotifier — HTML + plain-text digest, admin alerts
+notifier.py       EmailNotifier + NtfyNotifier — digest email, admin alerts, push
+store.py          SQLite state store (alerted/pushed/pending/caches/meta)
 tests/            pytest, no network
 ```

@@ -402,7 +402,6 @@ def _evaluate_condition_bucket(
         eff = effective_cost(landed, l.ships_from, my_country, vat_rate)
         enriched.append((landed, ccy, eff, l))
     enriched.sort(key=lambda t: t[2])
-    n = len(enriched)
     cond_short = condition_short(condition)
     bucket_ccy = enriched[0][1]
 
@@ -467,7 +466,9 @@ def _evaluate_condition_bucket(
     # Every verdict here is low-confidence: asking prices are aspirational, so we
     # lean on any real sales first, then a min-pool-size-guarded asking median.
     sym = currency_symbol(bucket_ccy)
-    items = sorted(float(l.buyer_price or l.price or 0.0) for *_, l in enriched)
+    # Positive item prices only: a zero-priced listing (missing API field) must not
+    # deflate the asking median, shrink the detached-low gap, or pad the pool size.
+    items = sorted(p for p in (float(l.buyer_price or l.price or 0.0) for *_, l in enriched) if p > 0)
     second_cheapest = items[1] if len(items) >= 2 else None
 
     # Sparse real sales (1..min-1) in the matching currency → "below sold low".
@@ -478,11 +479,12 @@ def _evaluate_condition_bucket(
         cnt = sold_cond.get("count") or 0
         lo = sold_cond.get("low")
         med = sold_cond.get("median")
-        if 1 <= cnt < (sold_min_points or 5) and lo and lo > 0:
+        # sold_min_points=None means the sold feature is off (mirrors _sold_leads).
+        if sold_min_points is not None and 1 <= cnt < sold_min_points and lo and lo > 0:
             sold_low, sold_low_median, sold_low_count = float(lo), float(med or lo), cnt
 
     asking_median = _median(items)
-    n = len(enriched)
+    n = len(items)
 
     out: list[Deal] = []
     for landed, ccy, eff, listing in enriched:

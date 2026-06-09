@@ -32,7 +32,7 @@ _SHOP_PAGE_URL = "https://www.discogs.com/shop/mywants/"
 
 
 class FetchResult(NamedTuple):
-    listings: list[dict]
+    listings: list[Listing]
     complete: bool          # False if pagination terminated early (don't advance last_run)
     cookie_invalid: bool    # True on 401/403 — session cookies need re-export
 
@@ -64,7 +64,9 @@ def session_expires_at(cookies: dict) -> datetime | None:
         b64 = raw[idx:end] if end != -1 else raw[idx:]
         ts = int(base64.b64decode(b64))
         return datetime.fromtimestamp(ts, tz=timezone.utc)
-    except (ValueError, KeyError):
+    except (ValueError, KeyError, OverflowError, OSError):
+        # OverflowError/OSError: a garbage _expires decoding to an out-of-range
+        # timestamp — still "malformed cookie", so still None.
         return None
 
 

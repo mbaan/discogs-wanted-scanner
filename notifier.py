@@ -2,8 +2,9 @@
 Notification layer.
 
 EmailNotifier sends digest emails (one per flush) and admin alerts (cookie
-expiry, watcher health). The Notifier base class is the extension point for
-a future push client.
+expiry, watcher health). NtfyNotifier is the push fast-lane client (instant
+ntfy pushes for top-tier deals); the Notifier base class is their shared
+contract.
 """
 
 import base64
@@ -40,8 +41,9 @@ except OSError as exc:
 
 class Notifier(ABC):
     @abstractmethod
-    def send(self, deals: list[Deal], run_time: datetime, **kwargs) -> None:
-        """Send a batch alert for the given deals."""
+    def send(self, deals: list[Deal], run_time: datetime, **kwargs) -> int | None:
+        """Send a batch alert for the given deals. Push implementations return
+        the delivered count; email returns None."""
 
 
 class EmailNotifier(Notifier):
@@ -647,7 +649,9 @@ def _signal_chips_html(deal) -> str:
             'border-radius:8px; font-size:11px; font-weight:600; '
             'border:1px solid #f0d678;">★ Discogs Deal</span>'
         )
-    if deal.historical_floor_pct:
+    # `is not None`: a deal can tie/beat the floor by < 1% (pct rounds to 0) and
+    # must still badge — the push path keys off the floor the same way.
+    if deal.historical_floor_pct is not None:
         chips.append(
             '<span style="background:#00695c; color:#fff; padding:1px 6px; '
             'border-radius:8px; font-size:11px; font-weight:600; '
@@ -727,8 +731,8 @@ def _scan_summary(scan_counts: dict | None) -> str:
         return ""
     scanned = scan_counts.get("scanned_releases")
     total = scan_counts.get("wantlist_total")
-    if not scanned:
-        return ""
+    if scanned is None:
+        return ""  # count unavailable — 0 is a real (reportable) result
     if total:
         return f"{scanned} of {total} wantlist releases for sale"
     return f"{scanned} wantlist release(s) for sale"
@@ -823,7 +827,7 @@ def _build_text(
         if d.sold_tier_caveat and d.sold_tier_caveat_grade:
             ccy = d.sold_median_currency or d.landed_currency
             primary += f" · ⚠ {d.sold_tier_caveat_grade} sells ~{_money(d.sold_tier_caveat_value, ccy)}"
-        if d.historical_floor_pct:
+        if d.historical_floor_pct is not None:
             primary += " · ⬇ all-time low"
         if getattr(d, "detached_low", False):
             primary += " · ⚠ verify pressing/grade"

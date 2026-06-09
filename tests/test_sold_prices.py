@@ -70,6 +70,20 @@ def test_parse_mixed_price_currency_returns_none():
     assert sold_prices.parse_sell_history(html) is None
 
 
+def test_parse_skips_rows_without_recognizable_currency():
+    # A drifted row whose price cell carries no known symbol must not slip its
+    # amount past the single-currency guard; the € rows still parse normally.
+    html = _table([
+        _row("Mint (M)", "€40.00"),
+        _row("Mint (M)", "€60.00"),
+        _row("Mint (M)", "CHF 55.00"),   # unrecognized symbol → row skipped
+    ])
+    stats = sold_prices.parse_sell_history(html)
+    assert stats["currency"] == "EUR"
+    assert stats["by_condition"]["Mint (M)"]["count"] == 2
+    assert stats["by_condition"]["Mint (M)"]["prices"] == [40.0, 60.0]
+
+
 def test_parse_missing_or_empty_returns_none():
     assert sold_prices.parse_sell_history("<html>no table here</html>") is None
     assert sold_prices.parse_sell_history("<table><tbody></tbody></table>") is None

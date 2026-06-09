@@ -620,16 +620,21 @@ def main(args: argparse.Namespace | None = None) -> None:
                 cur = float(d.buyer_price or d.price or 0.0)
                 if _push_fresh(cur, prev_pushed.get(d.id), cfg["price_drop_threshold"]):
                     fresh.append(d)
-                    pushed[d.id] = cur
             if fresh:
                 push = NtfyNotifier(
                     server=cfg["ntfy_server"], topic=cfg["ntfy_topic"],
                     token=cfg["ntfy_token"], priority=cfg["push_priority"],
                     max_per_run=cfg["push_max_per_run"],
                 )
+                # Mark only the deals actually handed to ntfy (its max_per_run cap):
+                # overflow beyond the cap stays unmarked so it can push next run
+                # instead of being silently deduped without ever buzzing the phone.
+                attempted = fresh[: cfg["push_max_per_run"]]
+                for d in attempted:
+                    pushed[d.id] = float(d.buyer_price or d.price or 0.0)
                 delivered = push.send(fresh, now)   # caps at max_per_run internally
                 logger.info("Push fast-lane: %d of %d top-tier deal(s) delivered via ntfy",
-                            delivered, min(len(fresh), cfg["push_max_per_run"]))
+                            delivered, len(attempted))
         except Exception as exc:
             logger.error("Push fast-lane failed (%s) — continuing; digest unaffected", exc)
 
@@ -650,12 +655,12 @@ def main(args: argparse.Namespace | None = None) -> None:
     except Exception:
         session_days_left = None
 
+    scan_counts = {"scanned_releases": scanned_releases, "wantlist_total": wantlist_total}
     flush_ok = False
     if should_flush:
         cap = cfg["max_deals_per_email"] or len(pending)  # 0 = no cap
         to_send = pending[:cap]
         extra = len(pending) - len(to_send)
-        scan_counts = {"scanned_releases": scanned_releases, "wantlist_total": wantlist_total}
         notifier = EmailNotifier(
             smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],
             smtp_user=cfg["smtp_user"], smtp_pass=cfg["smtp_pass"],
@@ -683,11 +688,10 @@ def main(args: argparse.Namespace | None = None) -> None:
     _report_cap = cfg["max_deals_per_email"] or len(pending)  # 0 = no cap
     _report_deals = pending[:_report_cap]
     _report_extra = len(pending) - len(_report_deals)
-    _report_scan = {"scanned_releases": scanned_releases, "wantlist_total": wantlist_total}
     _write_report(
         _report_path(), _report_deals, now,
         extra_count=_report_extra, session_days_left=session_days_left,
-        scan_counts=_report_scan,
+        scan_counts=scan_counts,
     )
 
     # ── Persist + heartbeat ──────────────────────────────────────────────────

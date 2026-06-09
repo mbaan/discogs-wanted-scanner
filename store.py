@@ -124,10 +124,16 @@ class Store:
         """Replace the alerted table; the _ALERTED_HARD_CAP prune (keep highest
         IDs — Discogs IDs grow monotonically) lives here so the rule is in one
         place."""
-        pruned = self._prune_alerted(alerted)
-        self.conn.execute("DELETE FROM alerted")
+        self._replace_id_price_table("alerted", alerted)
+
+    def _replace_id_price_table(self, table: str, data: dict[int, float]) -> None:
+        """Full replace of an {id: last_price} dedup table (alerted / pushed)
+        with the shared keep-highest-IDs cap. `table` is a code constant, never
+        user input."""
+        pruned = self._prune_alerted(data)
+        self.conn.execute(f"DELETE FROM {table}")
         self.conn.executemany(
-            "INSERT OR REPLACE INTO alerted(id, last_price) VALUES (?, ?)",
+            f"INSERT OR REPLACE INTO {table}(id, last_price) VALUES (?, ?)",
             [(int(k), float(v)) for k, v in pruned.items() if v is not None],
         )
         self.conn.commit()
@@ -154,13 +160,7 @@ class Store:
     def save_pushed(self, pushed: dict[int, float]) -> None:
         """Replace the pushed table; reuses the alerted prune (keep highest IDs —
         Discogs IDs grow monotonically) so a cold-start backlog can't bloat it."""
-        pruned = self._prune_alerted(pushed)
-        self.conn.execute("DELETE FROM pushed")
-        self.conn.executemany(
-            "INSERT OR REPLACE INTO pushed(id, last_price) VALUES (?, ?)",
-            [(int(k), float(v)) for k, v in pruned.items() if v is not None],
-        )
-        self.conn.commit()
+        self._replace_id_price_table("pushed", pushed)
 
     # ── pending_deals: list of Deal.to_pending() dicts (FIFO) ──
     def load_pending(self) -> list[dict]:

@@ -93,7 +93,6 @@ def build_deals(
             if prev is not None and prev > 0 and cur_price >= prev * (1 - cfg["price_drop_threshold"]):
                 continue  # already alerted at near this price
             new_deals.append(d)
-            just_alerted.append((d.id, cur_price))
             logger.info(
                 "Deal[%s]: %s — %s | %s%.2f landed | %s",
                 f"{d.discount_pct}%" if d.discount_pct is not None else d.deal_source,
@@ -102,7 +101,8 @@ def build_deals(
                 d.deal_reason,
             )
 
-        # Record price for every listing so re-alerts only fire on drops.
+        # Record price for every listing (deals included — same id, same price)
+        # so re-alerts only fire on drops.
         for l in group:
             just_alerted.append((l.id, float(l.buyer_price or l.price or 0.0)))
 
@@ -281,6 +281,12 @@ def annotate_historical_floor(deals: list[Deal], price_history: dict, min_points
         if rid is None or not cond:
             continue
         history = price_history.get(f"{rid}:{cond}") or []
+        # Same-currency observations only — a floor recorded in another currency
+        # is not comparable. Entries without 'c' (legacy rows) count as matching
+        # rather than vanishing from the history.
+        ccy = deal.landed_currency
+        if ccy:
+            history = [e for e in history if e.get("c") in (None, ccy)]
         if len(history) < min_points:
             continue
         floor = min(e["p"] for e in history)

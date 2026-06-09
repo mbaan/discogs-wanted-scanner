@@ -24,6 +24,9 @@ import logging
 import re
 import time
 from datetime import datetime, timezone
+from statistics import median
+
+from shipping_policy import _fresh
 
 logger = logging.getLogger(__name__)
 
@@ -40,20 +43,6 @@ _MEDIA_RE = re.compile(r'data-header="Media:"[^>]*>(.*?)</td>', re.DOTALL)
 _DATE_RE = re.compile(r'data-header="Order Date:"[^>]*>(.*?)</td>', re.DOTALL)
 _PRICE_RE = re.compile(r'<td class="price">(.*?)</td>', re.DOTALL)
 _DATE_FMT_RE = re.compile(r"\d{4}-\d{2}-\d{2}")
-
-
-# ── Freshness (copied from shipping_policy._fresh) ───────────────────────────
-
-def _fresh(ts_iso: str | None, ttl_days: int) -> bool:
-    if not ts_iso:
-        return False
-    try:
-        dt = datetime.fromisoformat(ts_iso)
-    except ValueError:
-        return False
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    return (datetime.now(timezone.utc) - dt).total_seconds() < ttl_days * 86400
 
 
 # ── Parse (pure, network-free, unit-testable on fixtures) ────────────────────
@@ -75,13 +64,6 @@ def _parse_money(raw: str | None) -> tuple[float | None, str | None]:
         return float(cleaned), code
     except ValueError:
         return None, code
-
-
-def _median(values: list[float]) -> float:
-    s = sorted(values)
-    n = len(s)
-    mid = n // 2
-    return s[mid] if n % 2 else (s[mid - 1] + s[mid]) / 2.0
 
 
 def parse_sell_history(html: str | None) -> dict | None:
@@ -106,11 +88,13 @@ def parse_sell_history(html: str | None) -> dict | None:
             continue
         amount, code = _parse_money(_text(pm.group(1)))
         cond = _text(mm.group(1))
-        if amount is None or not cond:
+        # code None = no recognizable currency symbol: the amount can't be
+        # currency-checked, so including it would slip past the single-currency
+        # guard below. Skip the row (parse drift degrades, never pollutes).
+        if amount is None or code is None or not cond:
             continue
         by_cond.setdefault(cond, []).append(amount)
-        if code:
-            codes.add(code)
+        codes.add(code)
         dm = _DATE_RE.search(row)
         if dm:
             d = _DATE_FMT_RE.search(_text(dm.group(1)))
@@ -123,7 +107,7 @@ def parse_sell_history(html: str | None) -> dict | None:
         return None
     by_condition = {
         cond: {
-            "median": round(_median(v), 2),
+            "median": round(median(v), 2),
             "count": len(v),
             "low": round(min(v), 2),
             "high": round(max(v), 2),

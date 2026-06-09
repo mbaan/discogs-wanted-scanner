@@ -94,6 +94,19 @@ def test_asking_min_pool_size_suppresses_small_pools():
     assert deals[0].low_confidence is True
 
 
+def test_zero_priced_listing_does_not_pad_asking_pool():
+    # 4 real listings + 1 zero-priced (missing API field): the zero row must not
+    # count toward asking_min_points or deflate the median, so no deal fires.
+    listings = [
+        _listing(1, buyer_price=20.0), _listing(2, buyer_price=90.0),
+        _listing(3, buyer_price=95.0), _listing(4, buyer_price=92.0),
+        _listing(5, buyer_price=0.0, price=0.0),
+    ]
+    assert evaluator.evaluate_release_group(
+        listings, my_country="Netherlands", asking_min_points=5, asking_deal_threshold=0.35,
+    ) == []
+
+
 def test_asking_fallback_is_effective_basis():
     listings = [
         _listing(1, buyer_price=20.0, shipping_buyer_price=40.0),

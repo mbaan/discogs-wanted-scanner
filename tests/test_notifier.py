@@ -268,6 +268,13 @@ def test_signal_chips_html_empty_when_none():
     assert notifier._signal_chips_html(_deal(1)) == ""
 
 
+def test_signal_chips_html_atl_renders_at_zero_pct():
+    # Beating the floor by < 1% rounds the pct to 0 — still an all-time low;
+    # the chip keys on presence (is not None), matching the push path.
+    html = notifier._signal_chips_html(_deal(1, historical_floor_pct=0))
+    assert "⬇ All-time low" in html
+
+
 def test_deal_html_new_hierarchy_and_cuts():
     d = _deal(1, release_artist="Miles Davis", release_title="Kind of Blue",
               release_year=1959, release_format="LP", release_country="US",
