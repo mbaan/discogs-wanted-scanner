@@ -186,6 +186,24 @@ def test_annotate_shipping_sets_basket_when_enabled(monkeypatch):
     assert deal.basket["saving"] == 7.0
 
 
+def test_annotate_shipping_threads_sold_stats_into_pick_discounts(monkeypatch):
+    monkeypatch.setattr(shipping_policy, "get_policy",
+                        lambda *a, **k: _FREE_POLICY)
+    deal = Deal(id=1, seller_uid=100, price=38.0, currency="EUR",
+                buyer_price=38.0, buyer_currency="EUR",
+                release_artist="A1", release_title="T1",
+                listing_url="https://www.discogs.com/sell/item/1")
+    pick = _ship_listing(2, 16.4)
+    pick.release_id = 777
+    groups = {100: [_ship_listing(1, 38.0), pick]}
+    sold = {777: {"currency": "EUR", "by_condition": {
+        "Very Good Plus (VG+)": {"median": 20.0, "count": 6},
+    }}}
+    cfg = {**_BASE_CFG, "combine_basket": False}
+    watcher._annotate_shipping([deal], groups, cfg, {}, {}, sold_stats_by_release=sold)
+    assert deal.seller_picks[0]["discount_pct"] == 18
+
+
 def test_annotate_shipping_skips_basket_when_disabled(monkeypatch):
     monkeypatch.setattr(shipping_policy, "get_policy",
                         lambda *a, **k: _FREE_POLICY)

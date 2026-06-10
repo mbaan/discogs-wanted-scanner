@@ -490,6 +490,16 @@ def _basket_text(deal) -> str:
     return f"  🛒 {head}: {detail}"
 
 
+def _pick_badge(pct) -> str:
+    """Display form of a pick's signed discount: stored +18 (18% below the sold
+    median) reads −18%; stored −15 reads +15%; 0 reads ±0%. Empty when None."""
+    if pct is None:
+        return ""
+    if pct > 0:
+        return f"−{pct}%"
+    return f"+{-pct}%" if pct < 0 else "±0%"
+
+
 def _shipping_html(deal) -> str:
     hint = deal.shipping_hint
     picks = deal.seller_picks or []
@@ -511,9 +521,14 @@ def _shipping_html(deal) -> str:
         cond = condition_short(p.get("media_condition"))
         title = _h((f'{p.get("release_artist")} – ' if p.get("release_artist") else "") + (p.get("release_title") or "?"))
         url = _h(p.get("listing_url") or "#")
+        pct = p.get("discount_pct")
+        badge = _pick_badge(pct)
+        if badge:
+            style = "color:#1b5e20; font-weight:600;" if pct > 0 else "color:#999;"
+            badge = f'<span style="{style}">{badge}</span> · '
         rows.append(
             f'<div style="margin-top:4px; font-size:12px; color:#555;">'
-            f'+ <a href="{url}" style="color:#555;">{amt}</a> · {cond} · {title}</div>'
+            f'+ <a href="{url}" style="color:#555;">{amt}</a> · {badge}{cond} · {title}</div>'
         )
     if others > len(picks):
         rows.append(f'<div style="margin-top:2px; font-size:12px; color:#999;">+{others - len(picks)} more</div>')
@@ -539,7 +554,9 @@ def _shipping_text(deal) -> list[str]:
         amt = _money(p.get("buyer_price"), p.get("buyer_currency"))
         cond = condition_short(p.get("media_condition"))
         title = (f'{p.get("release_artist")} – ' if p.get("release_artist") else "") + (p.get("release_title") or "?")
-        lines.append(f"  + {amt} · {cond} · {title} · {p.get('listing_url', '')}")
+        badge = _pick_badge(p.get("discount_pct"))
+        badge = f"{badge} · " if badge else ""
+        lines.append(f"  + {amt} · {badge}{cond} · {title} · {p.get('listing_url', '')}")
     if others > len(picks):
         lines.append(f"  +{others - len(picks)} more")
     return lines

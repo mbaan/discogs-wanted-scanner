@@ -613,15 +613,53 @@ def group_by_seller(
     return out
 
 
-def seller_picks(seller_listings: list[Listing], exclude_id: int, limit: int) -> tuple[list[dict], int]:
-    """Cheapest-first compact picks for the email, excluding the deal itself.
+def _pick_discount(listing: Listing, stats: dict | None) -> int | None:
+    """Signed % of a pick's price vs its condition's SOLD median (positive =
+    below median, i.e. a discount). Display-only context for the 'also from
+    this seller' rows: item price only, no shipping allowance — an add-on
+    rides in the same parcel. None when no benchmark applies (fail-open)."""
+    if not stats:
+        return None
+    by_cond = (stats.get("by_condition") or {}).get(listing.media_condition or "")
+    if not isinstance(by_cond, dict):
+        return None
+    median = by_cond.get("median")
+    if not median or median <= 0:
+        return None
+    if stats.get("currency") != (listing.buyer_currency or listing.currency):
+        return None
+    price = float(listing.buyer_price or listing.price or 0.0)
+    if price <= 0:
+        return None
+    return round((1.0 - price / float(median)) * 100)
+
+
+def seller_picks(
+    seller_listings: list[Listing],
+    exclude_id: int,
+    limit: int,
+    sold_stats_by_release: dict[int, dict] | None = None,
+) -> tuple[list[dict], int]:
+    """Compact picks for the email, excluding the deal itself.
+
+    Each pick carries a signed `discount_pct` vs its condition's sold median
+    (None without a benchmark). Sorted deepest-discount-first so the `limit`
+    cap keeps the best-value items; no-data picks come last, cheapest-first.
 
     Returns (picks_capped_at_limit, total_other_items).
     """
-    others = [l for l in seller_listings if l.id != exclude_id]
-    others.sort(key=lambda l: float(l.buyer_price or l.price or 0.0))
+    stats_map = sold_stats_by_release or {}
+    others = []
+    for l in seller_listings:
+        if l.id == exclude_id:
+            continue
+        stats = stats_map.get(int(l.release_id)) if l.release_id is not None else None
+        others.append((_pick_discount(l, stats), l))
+    others.sort(key=lambda t: (
+        t[0] is None, -(t[0] or 0), float(t[1].buyer_price or t[1].price or 0.0),
+    ))
     picks = []
-    for l in others[:limit]:
+    for pct, l in others[:limit]:
         picks.append({
             "release_artist": l.release_artist,
             "release_title": l.release_title,
@@ -629,5 +667,6 @@ def seller_picks(seller_listings: list[Listing], exclude_id: int, limit: int) ->
             "buyer_price": l.buyer_price or l.price,
             "buyer_currency": l.buyer_currency or l.currency,
             "listing_url": l.listing_url,
+            "discount_pct": pct,
         })
     return picks, len(others)

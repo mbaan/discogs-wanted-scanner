@@ -127,9 +127,11 @@ def test_estimate_room_tolerates_json_roundtrip_lists():
 
 # ── grouping helpers ─────────────────────────────────────────────────────────
 
-def _listing(lid, uid, price, media="Very Good Plus (VG+)", sleeve="Very Good Plus (VG+)"):
+def _listing(lid, uid, price, media="Very Good Plus (VG+)", sleeve="Very Good Plus (VG+)",
+             release_id=None, buyer_currency="EUR"):
     return Listing(id=lid, seller_uid=uid, buyer_price=price, price=price,
-                   buyer_currency="EUR", media_condition=media, sleeve_condition=sleeve,
+                   buyer_currency=buyer_currency, media_condition=media, sleeve_condition=sleeve,
+                   release_id=release_id,
                    release_artist=f"A{lid}", release_title=f"T{lid}",
                    listing_url=f"https://www.discogs.com/sell/item/{lid}")
 
@@ -152,6 +154,77 @@ def test_seller_picks_excludes_deal_sorts_and_caps():
     assert total == 2
     assert len(picks) == 1
     assert picks[0]["buyer_price"] == 10.0   # cheapest first
+    assert picks[0]["discount_pct"] is None  # no sold stats passed
+
+
+# Per-condition SOLD benchmark, shaped like sold_prices.get_sell_history output.
+_SOLD_VGP = {
+    777: {"currency": "EUR", "by_condition": {
+        "Very Good Plus (VG+)": {"median": 20.0, "count": 6},
+    }},
+}
+
+
+def test_seller_picks_signed_discount_vs_sold_median():
+    listings = [
+        _listing(1, 100, 38.0),                      # the deal itself (excluded)
+        _listing(2, 100, 16.4, release_id=777),      # 18% below median 20
+        _listing(3, 100, 23.0, release_id=777),      # 15% above median 20
+    ]
+    picks, total = evaluator.seller_picks(listings, exclude_id=1, limit=5,
+                                          sold_stats_by_release=_SOLD_VGP)
+    assert total == 2
+    assert picks[0]["discount_pct"] == 18    # below median (positive = discount)
+    assert picks[1]["discount_pct"] == -15   # above median
+
+
+def test_seller_picks_deepest_discount_first_cap_keeps_best_value():
+    sold = {777: _SOLD_VGP[777], 888: {"currency": "EUR", "by_condition": {
+        "Very Good Plus (VG+)": {"median": 50.0, "count": 4},
+    }}}
+    listings = [
+        _listing(1, 100, 99.0),                      # the deal itself
+        _listing(2, 100, 10.0),                      # cheapest but no sold data
+        _listing(3, 100, 30.0, release_id=888),      # 40% below its median 50
+        _listing(4, 100, 16.4, release_id=777),      # 18% below its median 20
+    ]
+    picks, total = evaluator.seller_picks(listings, exclude_id=1, limit=2,
+                                          sold_stats_by_release=sold)
+    assert total == 3
+    # The cap keeps the deepest discounts; the cheap no-data item misses the cut.
+    assert [p["discount_pct"] for p in picks] == [40, 18]
+
+
+def test_seller_picks_no_data_sorted_after_badged_cheapest_first():
+    listings = [
+        _listing(1, 100, 99.0),
+        _listing(2, 100, 25.0),                      # no data
+        _listing(3, 100, 8.0),                       # no data, cheaper
+        _listing(4, 100, 23.0, release_id=777),      # -15% (overpriced, but badged)
+    ]
+    picks, _ = evaluator.seller_picks(listings, exclude_id=1, limit=5,
+                                      sold_stats_by_release=_SOLD_VGP)
+    assert [p["discount_pct"] for p in picks] == [-15, None, None]
+    assert [p["buyer_price"] for p in picks] == [23.0, 8.0, 25.0]
+
+
+def test_pick_discount_guards():
+    stats = _SOLD_VGP[777]
+    # exactly at median -> 0, not None
+    assert evaluator._pick_discount(_listing(1, 100, 20.0, release_id=777), stats) == 0
+    # currency mismatch -> None
+    assert evaluator._pick_discount(
+        _listing(2, 100, 16.4, release_id=777, buyer_currency="USD"), stats) is None
+    # condition without sold data -> None
+    assert evaluator._pick_discount(
+        _listing(3, 100, 16.4, media="Good (G)", release_id=777), stats) is None
+    # median <= 0 -> None
+    bad = {"currency": "EUR", "by_condition": {"Very Good Plus (VG+)": {"median": 0.0}}}
+    assert evaluator._pick_discount(_listing(4, 100, 16.4, release_id=777), bad) is None
+    # price <= 0 -> None
+    assert evaluator._pick_discount(_listing(5, 100, 0.0, release_id=777), stats) is None
+    # no stats at all -> None
+    assert evaluator._pick_discount(_listing(6, 100, 16.4, release_id=777), None) is None
 
 
 # ── notifier rendering ───────────────────────────────────────────────────────
@@ -186,6 +259,34 @@ def test_shipping_block_renders_in_digest_without_crashing():
     assert "test-seller" in html and "more on your wantlist" in html
     assert "test-seller" in text
     assert "€9.00" in html  # the pick price
+
+
+def test_pick_rows_render_discount_badges():
+    deal = Deal(
+        id=1, release_title="X", media_condition="Mint (M)",
+        seller_username="test-seller", listing_url="u",
+        seller_total_others=4,
+        seller_picks=[
+            {"release_artist": "B", "release_title": "Below", "media_condition": "Mint (M)",
+             "buyer_price": 9.0, "buyer_currency": "EUR", "listing_url": "u2",
+             "discount_pct": 18},
+            {"release_artist": "C", "release_title": "Above", "media_condition": "Mint (M)",
+             "buyer_price": 14.0, "buyer_currency": "EUR", "listing_url": "u3",
+             "discount_pct": -15},
+            {"release_artist": "D", "release_title": "NoData", "media_condition": "Mint (M)",
+             "buyer_price": 7.5, "buyer_currency": "EUR", "listing_url": "u4",
+             "discount_pct": None},
+            # Legacy pick persisted before discount_pct existed: no key at all.
+            {"release_artist": "E", "release_title": "Legacy", "media_condition": "Mint (M)",
+             "buyer_price": 5.0, "buyer_currency": "EUR", "listing_url": "u5"},
+        ],
+    )
+    html = notifier._shipping_html(deal)
+    text = "\n".join(notifier._shipping_text(deal))
+    assert "−18%" in html and "−18%" in text            # below median: shown as a discount
+    assert "+15%" in html and "+15%" in text            # above median: shown as a markup
+    assert html.count("%") == 2 and text.count("%") == 2  # no badge on no-data/legacy rows
+    assert "#1b5e20" in html                            # discount badge is green
 
 
 # ── optimize_basket ────────────────────────────────────────────────────────

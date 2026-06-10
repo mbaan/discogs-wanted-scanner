@@ -343,11 +343,14 @@ def _maybe_send_admin_alert(store, cfg, now, key, subject, body):
 
 # ── Network annotations (opt-in via DISCOGS_TOKEN) ───────────────────────────
 
-def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
+def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache,
+                       sold_stats_by_release=None):
     """Attach a per-seller shipping hint + 'also wanted from this seller' picks.
 
     Reuses already-fetched wantlist listings for the picks (no extra requests);
-    the only network call is one cached v3 policy lookup per deal-seller.
+    `sold_stats_by_release` (already fetched for evaluation) gives each pick its
+    discount vs the sold median. The only network call is one cached v3 policy
+    lookup per deal-seller.
     """
     token, country = cfg["discogs_token"], cfg["my_country"]
     for d in deals:
@@ -357,7 +360,10 @@ def _annotate_shipping(deals, seller_groups, cfg, run_cache, policy_cache):
         listings = seller_groups.get(int(uid), [])
         if not listings:
             continue
-        picks, total_others = evaluator.seller_picks(listings, d.id, cfg["max_seller_picks"])
+        picks, total_others = evaluator.seller_picks(
+            listings, d.id, cfg["max_seller_picks"],
+            sold_stats_by_release=sold_stats_by_release,
+        )
         d.seller_picks = picks
         d.seller_total_others = total_others
 
@@ -594,7 +600,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     )
 
     if cfg["shipping_hints"] and cfg["discogs_token"]:
-        _annotate_shipping(new_deals, seller_groups, cfg, discogs_cache, policy_cache)
+        _annotate_shipping(new_deals, seller_groups, cfg, discogs_cache, policy_cache,
+                           sold_stats_by_release=sold_stats_by_release)
 
     # (Sold-price display annotation is applied inside core.build_digest, above.)
     pending.extend(new_deals)
