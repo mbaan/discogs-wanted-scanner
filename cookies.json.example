@@ -1,0 +1,7 @@
+{
+  "_comment": "Copy to cookies.json and paste your Discogs session cookies from browser DevTools.",
+  "_howto": "Brave/Chrome → F12 → Application → Cookies → https://www.discogs.com → copy 'sid' and 'session' values. cf_clearance is NOT required for the API endpoints; only sid + session matter.",
+  "_lifetime": "session embeds its own _expires (~180 days). sid is ~6 months per Discogs. Watcher warns 14 days before expiry and emails you when 401/403 starts.",
+  "sid": "paste_your_sid_cookie_value_here",
+  "session": "paste_your_session_cookie_value_here"
+}
