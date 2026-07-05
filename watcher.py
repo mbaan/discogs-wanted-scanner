@@ -259,6 +259,11 @@ def _load_config() -> dict:
         "reissue_min_ratio": _opt_float("REISSUE_MIN_RATIO"),
         "reissue_min_supply": _opt_int("REISSUE_MIN_SUPPLY"),
         "rating_min_count": _opt_int("RATING_MIN_COUNT"),
+        # Dig "watched, never a deal" is judged over only the last DIG_RECENT_DAYS of
+        # observations (so a structurally risen record isn't flattered by an old low);
+        # DIG_DRIFT_MIN_PCT is the floor rise that lands a record in "drifting out of reach".
+        "dig_recent_days": _opt_int("DIG_RECENT_DAYS"),
+        "dig_drift_min_pct": _opt_float("DIG_DRIFT_MIN_PCT"),
     }
 
     # The TTL is the one knob that matters when sold-prices is on — keep the
@@ -322,6 +327,10 @@ def _load_config() -> dict:
             cfg["reissue_min_supply"] = 12
         if cfg["rating_min_count"] is None:
             cfg["rating_min_count"] = 15
+        if cfg["dig_recent_days"] is None:
+            cfg["dig_recent_days"] = 45
+        if cfg["dig_drift_min_pct"] is None:
+            cfg["dig_drift_min_pct"] = 0.20
 
     if missing:
         logger.error(
@@ -573,7 +582,7 @@ def _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history, reissue
         if not wantlist:
             logger.warning("Weekly Dig: could not fetch wantlist — skipping this week")
             return
-        stats = weekly_dig.compute(wantlist, price_history, sell_history, cfg)
+        stats = weekly_dig.compute(wantlist, price_history, sell_history, cfg, now)
         suggestions = []
         if cfg["reissue_suggest_enabled"]:
             problem = weekly_dig.problem_releases(stats, cfg["reissue_min_ratio"])

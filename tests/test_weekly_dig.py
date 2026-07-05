@@ -5,7 +5,9 @@ import weekly_dig
 
 NM = "Near Mint (NM or M-)"
 M = "Mint (M)"
-CFG = {"sold_price_min_points": 5, "shipping_allowance": 7.0}
+CFG = {"sold_price_min_points": 5, "shipping_allowance": 7.0,
+       "dig_recent_days": 45, "dig_drift_min_pct": 0.20}
+NOW = datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc)   # cutoff = 2026-05-21
 
 
 def _sell(rid, by_cond, ccy="EUR"):
@@ -20,7 +22,7 @@ def _sell(rid, by_cond, ccy="EUR"):
 
 def test_never_seen_when_absent_from_price_history():
     wl = [{"release_id": 1, "artist": "A", "title": "T", "year": 2000}]
-    stats = weekly_dig.compute(wl, {}, {}, CFG)
+    stats = weekly_dig.compute(wl, {}, {}, CFG, NOW)
     assert stats.total_wantlist == 1 and stats.seen_count == 0
     assert [w["release_id"] for w in stats.never_seen] == [1]
 
@@ -30,25 +32,27 @@ def test_seen_but_never_a_deal_reports_gap():
     wl = [{"release_id": 1, "artist": "Underworld", "title": "Beaucoup Fish"}]
     ph = {f"1:{NM}": [{"d": "2026-07-01", "p": 114.0, "c": "EUR"},
                       {"d": "2026-07-02", "p": 110.0, "c": "EUR"}]}
-    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}), CFG)
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}), CFG, NOW)
     assert stats.gets_deal == 0 and len(stats.seen_never_deal) == 1
     nd = stats.seen_never_deal[0]
     assert nd.cheapest_seen == 110.0                      # min across days
     assert nd.gap_pct == round((110 / 89 - 1) * 100)      # +24
     assert nd.gap_eur == round(110 - 96.0, 2)
+    assert nd.recent_obs == 2                             # two sighting-days back the floor
+    assert nd.sold_count == 10                            # sales behind the median
 
 
 def test_gets_deal_when_cheapest_at_or_below_benchmark():
     wl = [{"release_id": 1}]
     ph = {f"1:{NM}": [{"d": "2026-07-01", "p": 95.0, "c": "EUR"}]}  # <= 89+7
-    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}), CFG)
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}), CFG, NOW)
     assert stats.gets_deal == 1 and stats.seen_never_deal == []
 
 
 def test_no_benchmark_when_too_few_sold_points():
     wl = [{"release_id": 1}]
     ph = {f"1:{NM}": [{"d": "2026-07-01", "p": 110.0, "c": "EUR"}]}
-    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 3)}), CFG)  # 3 < 5
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 3)}), CFG, NOW)  # 3 < 5
     assert stats.no_benchmark == 1 and stats.seen_count == 1
     assert stats.seen_never_deal == []
 
@@ -56,7 +60,7 @@ def test_no_benchmark_when_too_few_sold_points():
 def test_currency_mismatch_is_not_judged():
     wl = [{"release_id": 1}]
     ph = {f"1:{NM}": [{"d": "2026-07-01", "p": 50.0, "c": "USD"}]}
-    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}, ccy="EUR"), CFG)
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}, ccy="EUR"), CFG, NOW)
     assert stats.no_benchmark == 1
 
 
@@ -65,9 +69,58 @@ def test_closest_condition_wins():
     wl = [{"release_id": 1}]
     ph = {f"1:{NM}": [{"d": "2026-07-01", "p": 98.0, "c": "EUR"}],
           f"1:{M}": [{"d": "2026-07-01", "p": 360.0, "c": "EUR"}]}
-    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10), M: (120.0, 8)}), CFG)
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10), M: (120.0, 8)}), CFG, NOW)
     assert len(stats.seen_never_deal) == 1
     assert stats.seen_never_deal[0].condition == NM
+
+
+# ── recent-window gap (structural price rise) ─────────────────────────────────
+
+def test_recent_window_makes_risen_record_never_a_deal():
+    # Old €50 (Jan, before the 45d cutoff) vs recent €110 (Jul). Sold median €89.
+    # All-time min would look like a deal; the recent min is honestly never-a-deal.
+    wl = [{"release_id": 1}]
+    ph = {f"1:{NM}": [{"d": "2026-01-01", "p": 50.0, "c": "EUR"},
+                      {"d": "2026-07-01", "p": 110.0, "c": "EUR"}]}
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}), CFG, NOW)
+    assert stats.gets_deal == 0
+    assert len(stats.seen_never_deal) == 1
+    assert stats.seen_never_deal[0].cheapest_seen == 110.0   # recent, not the old €50
+
+
+def test_large_recent_window_reverts_to_all_time():
+    wl = [{"release_id": 1}]
+    ph = {f"1:{NM}": [{"d": "2026-01-01", "p": 50.0, "c": "EUR"},
+                      {"d": "2026-07-01", "p": 110.0, "c": "EUR"}]}
+    cfg = {**CFG, "dig_recent_days": 3650}   # window spans all history → old €50 counts
+    stats = weekly_dig.compute(wl, ph, _sell(1, {NM: (89.0, 10)}), cfg, NOW)
+    assert stats.gets_deal == 1
+
+
+# ── drift detection ───────────────────────────────────────────────────────────
+
+def test_drift_flags_structural_rise():
+    wl = [{"release_id": 1, "artist": "X", "title": "Y"}]
+    ph = {f"1:{NM}": [{"d": "2026-01-01", "p": 50.0, "c": "EUR"},   # earlier floor
+                      {"d": "2026-07-01", "p": 80.0, "c": "EUR"}]}  # recent floor, +60%
+    stats = weekly_dig.compute(wl, ph, {}, CFG, NOW)   # sold data irrelevant to drift
+    assert len(stats.drifting) == 1
+    d = stats.drifting[0]
+    assert (d.earlier_floor, d.recent_floor, d.pct) == (50.0, 80.0, 60)
+    assert (d.earlier_n, d.recent_n) == (1, 1)           # one sighting each side
+
+
+def test_no_drift_without_history_on_both_sides():
+    wl = [{"release_id": 1}]
+    ph = {f"1:{NM}": [{"d": "2026-07-01", "p": 80.0, "c": "EUR"}]}   # recent only
+    assert weekly_dig.compute(wl, ph, {}, CFG, NOW).drifting == []
+
+
+def test_no_drift_below_threshold():
+    wl = [{"release_id": 1}]
+    ph = {f"1:{NM}": [{"d": "2026-01-01", "p": 80.0, "c": "EUR"},
+                      {"d": "2026-07-01", "p": 88.0, "c": "EUR"}]}   # +10% < 20%
+    assert weekly_dig.compute(wl, ph, {}, CFG, NOW).drifting == []
 
 
 # ── should_send() cadence ─────────────────────────────────────────────────────

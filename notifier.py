@@ -1024,6 +1024,7 @@ def _footer_html() -> str:
 
 _DIG_MAX_NEVER_DEAL = 15
 _DIG_MAX_NEVER_SEEN = 40
+_DIG_MAX_DRIFT = 12
 
 
 def _build_dig_subject(stats, suggestions) -> str:
@@ -1059,11 +1060,25 @@ def _dig_never_deal_row(nd) -> str:
             f'<td style="padding:6px 0; border-bottom:1px solid {_HAIR}; font-family:{_SERIF}; '
             f'font-size:14px; color:{_INK};">{_dig_ident(nd.artist, nd.title)} '
             f'<span style="font-family:{_COND}; font-size:12px; color:{_MUTED};">'
-            f'({condition_short(nd.condition)})</span></td>'
+            f'({condition_short(nd.condition)} · seen {nd.recent_obs}×)</span></td>'
             f'<td align="right" style="padding:6px 0; border-bottom:1px solid {_HAIR}; '
             f'white-space:nowrap; font-family:{_MONO}; font-size:12px; color:{_MUTED};">'
             f'{_money(nd.cheapest_seen, nd.currency)} vs {_money(nd.sold_median, nd.currency)} sold '
+            f'({nd.sold_count} sale{"" if nd.sold_count == 1 else "s"}) '
             f'<strong style="color:{color};">+{nd.gap_pct}%</strong></td></tr>')
+
+
+def _dig_drift_row(d) -> str:
+    return (f'<tr>'
+            f'<td style="padding:6px 0; border-bottom:1px solid {_HAIR}; font-family:{_SERIF}; '
+            f'font-size:14px; color:{_INK};">{_dig_ident(d.artist, d.title)} '
+            f'<span style="font-family:{_COND}; font-size:12px; color:{_MUTED};">'
+            f'({condition_short(d.condition)})</span></td>'
+            f'<td align="right" style="padding:6px 0; border-bottom:1px solid {_HAIR}; '
+            f'white-space:nowrap; font-family:{_MONO}; font-size:12px; color:{_MUTED};">'
+            f'{_money(d.earlier_floor, d.currency)} ({d.earlier_n}×) → '
+            f'{_money(d.recent_floor, d.currency)} ({d.recent_n}×) '
+            f'<strong style="color:{_OX};">+{d.pct}%</strong></td></tr>')
 
 
 def _dig_suggestion(sug) -> str:
@@ -1133,6 +1148,18 @@ def _build_dig_html(stats, suggestions, run_time: datetime, session_days_left: i
             + '(sold median + shipping). How far the cheapest ever got:</div>'
             + f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}</table>{note}'))
 
+    if stats.drifting:
+        rows = "".join(_dig_drift_row(d) for d in stats.drifting[:_DIG_MAX_DRIFT])
+        extra = len(stats.drifting) - _DIG_MAX_DRIFT
+        note = (f'<div style="font-family:{_COND}; font-size:12px; color:{_FAINT}; padding:10px 0 0;">'
+                f'+{extra} more drifting up</div>' if extra > 0 else "")
+        cards.append(_dig_card(
+            _dig_section_title("Drifting out of reach · biggest riser first")
+            + '<div style="font-family:' + _COND + '; font-size:12px; color:' + _MUTED
+            + '; margin:-4px 0 12px;">The cheapest copy has climbed structurally vs earlier in the '
+            + 'window — these are getting away from you (earlier floor → recent floor):</div>'
+            + f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}</table>{note}'))
+
     if suggestions:
         body = "".join(_dig_suggestion(s) for s in suggestions)
         cards.append(_dig_card(
@@ -1149,7 +1176,10 @@ def _build_dig_html(stats, suggestions, run_time: datetime, session_days_left: i
         f'<div style="font-family:{_COND}; font-size:11px; line-height:1.65; color:#6b6358;">'
         f'The Weekly Dig is a status snapshot of your whole wantlist — separate from deal alerts, '
         f'sent once a week. Nothing here needs action; it just shows what’s being watched, what never '
-        f'reaches deal price, and where a different pressing might serve you better.</div>')
+        f'reaches deal price, and where a different pressing might serve you better. '
+        f'<strong style="color:{_FAINT};">seen N×</strong> = days a copy was spotted in the recent '
+        f'window; <strong style="color:{_FAINT};">N sales</strong> = real sold count behind the median '
+        f'— the higher each is, the more the figure is worth trusting.</div>')
 
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
@@ -1174,9 +1204,21 @@ def _build_dig_text(stats, suggestions, run_time: datetime) -> str:
         lines.append("WATCHED, NEVER A DEAL (closest first):")
         for nd in stats.seen_never_deal[:_DIG_MAX_NEVER_DEAL]:
             ident = (f"{nd.artist} - " if nd.artist else "") + (nd.title or "?")
-            lines.append(f"  {ident} ({condition_short(nd.condition)}) — "
-                         f"{_money(nd.cheapest_seen, nd.currency)} vs {_money(nd.sold_median, nd.currency)} sold (+{nd.gap_pct}%)")
+            lines.append(f"  {ident} ({condition_short(nd.condition)}, seen {nd.recent_obs}x) — "
+                         f"{_money(nd.cheapest_seen, nd.currency)} vs {_money(nd.sold_median, nd.currency)} sold "
+                         f"({nd.sold_count} sales, +{nd.gap_pct}%)")
         extra = len(stats.seen_never_deal) - _DIG_MAX_NEVER_DEAL
+        if extra > 0:
+            lines.append(f"  +{extra} more")
+        lines.append("")
+    if stats.drifting:
+        lines.append("DRIFTING OUT OF REACH (biggest riser first):")
+        for d in stats.drifting[:_DIG_MAX_DRIFT]:
+            ident = (f"{d.artist} - " if d.artist else "") + (d.title or "?")
+            lines.append(f"  {ident} ({condition_short(d.condition)}) — "
+                         f"{_money(d.earlier_floor, d.currency)} ({d.earlier_n}x) -> "
+                         f"{_money(d.recent_floor, d.currency)} ({d.recent_n}x) (+{d.pct}%)")
+        extra = len(stats.drifting) - _DIG_MAX_DRIFT
         if extra > 0:
             lines.append(f"  +{extra} more")
         lines.append("")
