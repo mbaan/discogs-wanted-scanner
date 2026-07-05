@@ -140,3 +140,64 @@ def wantlist_size(
 
     cache[key] = int(items) if isinstance(items, int) else None
     return cache[key]
+
+
+def wantlist_releases(
+    username: str,
+    *,
+    token: str,
+    cache: dict,
+    max_pages: int = 20,
+) -> list[dict] | None:
+    """The full wantlist as [{release_id, artist, title, year}, ...], or None on
+    failure/throttle.
+
+    Paginates /wants (100/page). Used by the Weekly Dig only (once a week), so the
+    per-run cost is one short paginated sweep. Memoized into the caller's cache.
+    `max_pages` is a safety cap (2000 items); a real wantlist is far smaller.
+    Returns None (not []) on any error so the caller can tell "couldn't fetch"
+    from "genuinely empty" and skip the Dig rather than report a hollow one."""
+    key = f"_wantlist_releases:{username}"
+    if key in cache:
+        return cache[key]
+
+    headers = {
+        "Authorization": f"Discogs token={token}",
+        "User-Agent": _USER_AGENT,
+        "Accept": "application/json",
+    }
+    items: list[dict] = []
+    page = 1
+    while page <= max_pages:
+        resp = _get_with_429_retry(
+            f"{_BASE}/users/{username}/wants",
+            headers=headers, params={"per_page": 100, "page": page}, cache=cache,
+            label=f"wants({username}) p{page}",
+        )
+        if resp is None or resp.status_code != 200:
+            if resp is not None:
+                logger.warning("wants(%s) HTTP %d: %.200s", username, resp.status_code, resp.text)
+            cache[key] = None
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            logger.warning("wants(%s) non-JSON response", username)
+            cache[key] = None
+            return None
+        for w in data.get("wants", []):
+            bi = w.get("basic_information") or {}
+            artists = bi.get("artists") or []
+            items.append({
+                "release_id": bi.get("id"),
+                "artist": (artists[0].get("name") if artists and isinstance(artists[0], dict) else None),
+                "title": bi.get("title"),
+                "year": bi.get("year"),
+            })
+        pages = (data.get("pagination") or {}).get("pages") or 1
+        if page >= pages:
+            break
+        page += 1
+
+    cache[key] = items
+    return items

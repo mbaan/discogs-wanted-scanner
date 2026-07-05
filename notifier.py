@@ -89,6 +89,21 @@ class EmailNotifier(Notifier):
         self._send_message(msg)
         logger.info("Email sent to %s (%d deal(s), %d extra)", self.smtp_to, len(deals), extra_count)
 
+    def send_weekly_dig(self, stats, suggestions, run_time: datetime,
+                        session_days_left: int | None = None) -> None:
+        """Send the once-a-week Wantlist Dig (status digest). Separate from the
+        deal digest and push — its own email, its own subject — so it can be
+        reflective without adding alert noise."""
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = _build_dig_subject(stats, suggestions)
+        msg["From"] = self.smtp_from
+        msg["To"] = self.smtp_to
+        msg.attach(MIMEText(_build_dig_text(stats, suggestions, run_time), "plain"))
+        msg.attach(MIMEText(_build_dig_html(stats, suggestions, run_time, session_days_left), "html"))
+        self._send_message(msg)
+        logger.info("Weekly Dig sent to %s (%d watched, %d never-a-deal, %d swap suggestion(s))",
+                    self.smtp_to, stats.seen_count, len(stats.seen_never_deal), len(suggestions))
+
     def send_admin_alert(self, subject: str, body: str) -> None:
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"[Discogs Watcher] {subject}"
@@ -1000,6 +1015,196 @@ def _footer_html() -> str:
         f'= the cheapest copy on sale at this grade or better. Sticker colour shows how much to trust the price: '
         f'brass = real sales back it, amber = check first, grey = no data.</div>'
     )
+
+
+# ── The Weekly Dig (weekly status digest) ─────────────────────────────────────
+# A once-a-week reflective email — what's watched-but-never-a-deal, and which
+# scarce picks have a more-available pressing to swap to. Same visual language as
+# the deal digest (WAX ground, CARD panels, serif headings), simpler layout.
+
+_DIG_MAX_NEVER_DEAL = 15
+_DIG_MAX_NEVER_SEEN = 40
+
+
+def _build_dig_subject(stats, suggestions) -> str:
+    s = "s" if len(suggestions) != 1 else ""
+    return (f"[Discogs Watcher] ⛏ The Weekly Dig — {stats.seen_count} watched, "
+            f"{len(stats.seen_never_deal)} never a deal, {len(suggestions)} swap{s}")
+
+
+def _dig_card(inner: str) -> str:
+    return (f'<tr><td style="padding:0 0 16px;"><div style="background:{_CARD}; '
+            f'border:1px solid {_HAIR}; border-radius:10px; padding:18px 20px;">{inner}</div></td></tr>')
+
+
+def _dig_section_title(text: str) -> str:
+    return (f'<div style="font-family:{_COND}; text-transform:uppercase; letter-spacing:.18em; '
+            f'font-size:12px; font-weight:bold; color:{_OX}; margin:0 0 12px;">{_h(text)}</div>')
+
+
+def _dig_stat_tile(value, label: str) -> str:
+    return (f'<td align="center" style="padding:8px 6px;">'
+            f'<div style="font-family:{_SERIF}; font-size:27px; color:{_INK};">{value}</div>'
+            f'<div style="font-family:{_COND}; font-size:11px; text-transform:uppercase; '
+            f'letter-spacing:.1em; color:{_MUTED}; margin-top:2px;">{_h(label)}</div></td>')
+
+
+def _dig_ident(artist, title) -> str:
+    return _h((f"{artist} – " if artist else "") + (title or "?"))
+
+
+def _dig_never_deal_row(nd) -> str:
+    color = _BRASS_DK if nd.gap_pct <= 15 else (_MUTED if nd.gap_pct <= 40 else _FAINT)
+    return (f'<tr>'
+            f'<td style="padding:6px 0; border-bottom:1px solid {_HAIR}; font-family:{_SERIF}; '
+            f'font-size:14px; color:{_INK};">{_dig_ident(nd.artist, nd.title)} '
+            f'<span style="font-family:{_COND}; font-size:12px; color:{_MUTED};">'
+            f'({condition_short(nd.condition)})</span></td>'
+            f'<td align="right" style="padding:6px 0; border-bottom:1px solid {_HAIR}; '
+            f'white-space:nowrap; font-family:{_MONO}; font-size:12px; color:{_MUTED};">'
+            f'{_money(nd.cheapest_seen, nd.currency)} vs {_money(nd.sold_median, nd.currency)} sold '
+            f'<strong style="color:{color};">+{nd.gap_pct}%</strong></td></tr>')
+
+
+def _dig_suggestion(sug) -> str:
+    s = sug["suggestion"]
+    low = s.get("lowest_price")
+    low_s = _money(low, "EUR") if isinstance(low, (int, float)) else "—"
+    rating = s.get("rating_avg")
+    rating_s = f'{rating}/5 ({s.get("rating_count")})' if rating else "unrated"
+    warn = ""
+    if s.get("low_rating"):
+        warn = (f'<div style="font-family:{_COND}; font-size:12px; color:{_OX}; margin-top:4px;">'
+                f'⚠ mixed reviews ({rating_s}) — worth checking why before you wantlist it</div>')
+    url = f'https://www.discogs.com/release/{s["id"]}'
+    return (f'<div style="padding:10px 0; border-bottom:1px solid {_HAIR};">'
+            f'<div style="font-family:{_SERIF}; font-size:14px; color:{_INK};">'
+            f'{_dig_ident(sug.get("artist"), sug.get("title"))}</div>'
+            f'<div style="font-family:{_COND}; font-size:13px; color:{_MUTED}; margin-top:4px;">'
+            f'→ wantlist <a href="{url}" style="color:{_OX}; text-decoration:none;">release {s["id"]}</a> '
+            f'· {_h(str(s.get("country") or ""))} {_h(str(s.get("year") or ""))} '
+            f'· <strong style="color:{_INK};">{s.get("num_for_sale")} for sale</strong> '
+            f'· from {low_s} · rating {rating_s}</div>{warn}</div>')
+
+
+def _dig_never_seen(items: list[dict]) -> str:
+    rows = []
+    for w in items[:_DIG_MAX_NEVER_SEEN]:
+        yr = f' ({w.get("year")})' if w.get("year") else ""
+        rows.append(f'<div style="font-family:{_SERIF}; font-size:13px; color:{_INK}; padding:4px 0; '
+                    f'border-bottom:1px solid {_HAIR};">{_dig_ident(w.get("artist"), w.get("title"))}{_h(yr)}</div>')
+    more = len(items) - _DIG_MAX_NEVER_SEEN
+    if more > 0:
+        rows.append(f'<div style="font-family:{_COND}; font-size:12px; color:{_FAINT}; '
+                    f'padding:8px 0 0;">+{more} more</div>')
+    return "".join(rows)
+
+
+def _build_dig_html(stats, suggestions, run_time: datetime, session_days_left: int | None = None) -> str:
+    run_str = run_time.strftime("%d %b %Y")
+    header = (
+        f'<div style="background:{_WAX}; border-radius:10px; padding:24px 26px; margin-bottom:16px;">'
+        f'<div style="font-family:{_COND}; text-transform:uppercase; letter-spacing:.34em; '
+        f'font-size:11px; font-weight:bold; color:#D6A93C;">⛏&nbsp;&nbsp;The Weekly Dig</div>'
+        f'<div style="font-family:{_SERIF}; font-size:28px; line-height:1.15; color:#F7F2E7; margin-top:10px;">'
+        f'Your wantlist, this week</div>'
+        f'<div style="font-family:{_COND}; font-size:12px; letter-spacing:.04em; color:#D7CBB4; '
+        f'margin-top:8px;">{_h(run_str)}</div></div>'
+    )
+    tiles = (
+        f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0"><tr>'
+        + _dig_stat_tile(stats.total_wantlist, "on wantlist")
+        + _dig_stat_tile(stats.seen_count, "seen for sale")
+        + _dig_stat_tile(stats.gets_deal, "deal-worthy")
+        + _dig_stat_tile(len(stats.never_seen), "never seen")
+        + '</tr></table>'
+    )
+    cards = [_dig_card(tiles)]
+
+    if stats.seen_never_deal:
+        rows = "".join(_dig_never_deal_row(nd) for nd in stats.seen_never_deal[:_DIG_MAX_NEVER_DEAL])
+        extra = len(stats.seen_never_deal) - _DIG_MAX_NEVER_DEAL
+        note = (f'<div style="font-family:{_COND}; font-size:12px; color:{_FAINT}; padding:10px 0 0;">'
+                f'+{extra} more watched, never a deal</div>' if extra > 0 else "")
+        cards.append(_dig_card(
+            _dig_section_title("Watched, never a deal · closest first")
+            + '<div style="font-family:' + _COND + '; font-size:12px; color:' + _MUTED
+            + '; margin:-4px 0 12px;">A copy at your grade shows up, but its all-in cost never dips to the going rate '
+            + '(sold median + shipping). How far the cheapest ever got:</div>'
+            + f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}</table>{note}'))
+
+    if suggestions:
+        body = "".join(_dig_suggestion(s) for s in suggestions)
+        cards.append(_dig_card(
+            _dig_section_title("Swap for a copy you can actually get")
+            + '<div style="font-family:' + _COND + '; font-size:12px; color:' + _MUTED
+            + '; margin:-4px 0 8px;">Same album, a more-available EU pressing:</div>' + body))
+
+    if stats.never_seen:
+        cards.append(_dig_card(
+            _dig_section_title("Never seen for sale · at your grade")
+            + _dig_never_seen(stats.never_seen)))
+
+    footer = (
+        f'<div style="font-family:{_COND}; font-size:11px; line-height:1.65; color:#6b6358;">'
+        f'The Weekly Dig is a status snapshot of your whole wantlist — separate from deal alerts, '
+        f'sent once a week. Nothing here needs action; it just shows what’s being watched, what never '
+        f'reaches deal price, and where a different pressing might serve you better.</div>')
+
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+<body style="margin:0; padding:0; background:{_WAX};">
+  <div style="background:{_WAX}; padding:30px 16px;">
+    <table role="presentation" width="680" align="center" cellpadding="0" cellspacing="0" style="width:680px; max-width:100%; margin:0 auto;">
+      <tr><td>{header}</td></tr>
+      {''.join(cards)}
+      <tr><td style="padding:2px 12px 8px;">{footer}</td></tr>
+    </table>
+  </div>
+</body></html>"""
+
+
+def _build_dig_text(stats, suggestions, run_time: datetime) -> str:
+    run_str = run_time.strftime("%d %b %Y")
+    lines = [f"THE WEEKLY DIG — {run_str}", ""]
+    lines.append(f"{stats.total_wantlist} on wantlist · {stats.seen_count} seen for sale · "
+                 f"{stats.gets_deal} deal-worthy · {len(stats.never_seen)} never seen")
+    lines.append("")
+    if stats.seen_never_deal:
+        lines.append("WATCHED, NEVER A DEAL (closest first):")
+        for nd in stats.seen_never_deal[:_DIG_MAX_NEVER_DEAL]:
+            ident = (f"{nd.artist} - " if nd.artist else "") + (nd.title or "?")
+            lines.append(f"  {ident} ({condition_short(nd.condition)}) — "
+                         f"{_money(nd.cheapest_seen, nd.currency)} vs {_money(nd.sold_median, nd.currency)} sold (+{nd.gap_pct}%)")
+        extra = len(stats.seen_never_deal) - _DIG_MAX_NEVER_DEAL
+        if extra > 0:
+            lines.append(f"  +{extra} more")
+        lines.append("")
+    if suggestions:
+        lines.append("SWAP FOR A COPY YOU CAN ACTUALLY GET:")
+        for sug in suggestions:
+            s = sug["suggestion"]
+            ident = (f"{sug.get('artist')} - " if sug.get("artist") else "") + (sug.get("title") or "?")
+            low = s.get("lowest_price")
+            low_s = _money(low, "EUR") if isinstance(low, (int, float)) else "-"
+            rating = s.get("rating_avg")
+            rating_s = f"{rating}/5 ({s.get('rating_count')})" if rating else "unrated"
+            lines.append(f"  {ident}")
+            lines.append(f"    -> release {s['id']} · {s.get('country') or ''} {s.get('year') or ''} · "
+                         f"{s.get('num_for_sale')} for sale · from {low_s} · rating {rating_s}"
+                         + ("  [!] mixed reviews — check first" if s.get("low_rating") else ""))
+        lines.append("")
+    if stats.never_seen:
+        lines.append("NEVER SEEN FOR SALE (at your grade):")
+        for w in stats.never_seen[:_DIG_MAX_NEVER_SEEN]:
+            ident = (f"{w.get('artist')} - " if w.get("artist") else "") + (w.get("title") or "?")
+            yr = f" ({w.get('year')})" if w.get("year") else ""
+            lines.append(f"  {ident}{yr}")
+        more = len(stats.never_seen) - _DIG_MAX_NEVER_SEEN
+        if more > 0:
+            lines.append(f"  +{more} more")
+        lines.append("")
+    return "\n".join(lines)
 
 
 def _build_subject(deals: list[Deal]) -> str:

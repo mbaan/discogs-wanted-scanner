@@ -15,9 +15,11 @@ import core
 import discogs_api
 import evaluator
 import marketplace
+import reissue_finder
 import shipping_policy
 import shop_api
 import sold_prices
+import weekly_dig
 from models import Deal
 from notifier import EmailNotifier, NtfyNotifier, _build_html
 from store import _PENDING_HARD_CAP, Store
@@ -242,6 +244,21 @@ def _load_config() -> dict:
         "push_min_discount": _opt_float("PUSH_MIN_DISCOUNT"),
         "push_priority": _opt("PUSH_PRIORITY"),
         "push_max_per_run": _opt_int("PUSH_MAX_PER_RUN"),
+        # ── The Weekly Dig — once-a-week wantlist status digest (optional) ──
+        # Fires from inside a normal hourly run when its weekday/hour window opens
+        # and a week has passed; independent of the deal digest, the daily email
+        # cap, and push, so it adds no alert noise.
+        "weekly_dig_enabled": _opt_bool("WEEKLY_DIG_ENABLED"),
+        "weekly_dig_dow": _opt_int("WEEKLY_DIG_DOW"),
+        "weekly_dig_hour_utc": _opt_int("WEEKLY_DIG_HOUR_UTC"),
+        # Swap-suggestion sub-feature: find a more-available EU pressing for
+        # never-hitting picks (PAT calls, cached long, negatives cached too).
+        "reissue_suggest_enabled": _opt_bool("REISSUE_SUGGEST_ENABLED"),
+        "reissue_cache_ttl_days": _opt_int("REISSUE_CACHE_TTL_DAYS"),
+        "reissue_max_lookups_per_run": _opt_int("REISSUE_MAX_LOOKUPS_PER_RUN"),
+        "reissue_min_ratio": _opt_float("REISSUE_MIN_RATIO"),
+        "reissue_min_supply": _opt_int("REISSUE_MIN_SUPPLY"),
+        "rating_min_count": _opt_int("RATING_MIN_COUNT"),
     }
 
     # The TTL is the one knob that matters when sold-prices is on — keep the
@@ -287,6 +304,24 @@ def _load_config() -> dict:
             logger.warning("Unsupported PUSH_CHANNEL=%r — push disabled this run",
                            cfg["push_channel"])
             cfg["push_enabled"] = False
+
+    # ── Weekly Dig: silent sensible defaults when the feature is on, same pattern
+    # as the sold-price knobs (Pi runs without forcing .env edits on deploy). ──
+    if cfg["weekly_dig_enabled"]:
+        if cfg["weekly_dig_dow"] is None:
+            cfg["weekly_dig_dow"] = 6       # Sunday (Mon=0 … Sun=6)
+        if cfg["weekly_dig_hour_utc"] is None:
+            cfg["weekly_dig_hour_utc"] = 18  # ≈ 20:00 CEST — Sunday evening
+        if cfg["reissue_cache_ttl_days"] is None:
+            cfg["reissue_cache_ttl_days"] = 60
+        if cfg["reissue_max_lookups_per_run"] is None:
+            cfg["reissue_max_lookups_per_run"] = 8
+        if cfg["reissue_min_ratio"] is None:
+            cfg["reissue_min_ratio"] = 1.8
+        if cfg["reissue_min_supply"] is None:
+            cfg["reissue_min_supply"] = 12
+        if cfg["rating_min_count"] is None:
+            cfg["rating_min_count"] = 15
 
     if missing:
         logger.error(
@@ -516,6 +551,50 @@ def _report_path():
     return Path(override) if override else _REPORT_FILE
 
 
+# ── The Weekly Dig ─────────────────────────────────────────────────────────────
+
+def _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history, reissue_cache, run_cache) -> None:
+    """Send the weekly status Dig if its window is open and a week has passed.
+    Best-effort and fully isolated: any failure logs and is swallowed so a Dig
+    problem can never disturb the hourly deal run. `reissue_cache` is mutated in
+    place (new conclusions) and persisted by the caller regardless of send outcome,
+    so lookups already spent aren't repeated even if the email itself fails."""
+    if not cfg["weekly_dig_enabled"]:
+        return
+    if not weekly_dig.should_send(now, cfg["weekly_dig_dow"], cfg["weekly_dig_hour_utc"],
+                                  store.get_meta("weekly_dig_sent_at")):
+        return
+    if not (cfg["discogs_token"] and cfg["discogs_username"]):
+        logger.warning("Weekly Dig due but DISCOGS_TOKEN/DISCOGS_USERNAME unset — skipping")
+        return
+    try:
+        wantlist = discogs_api.wantlist_releases(
+            cfg["discogs_username"], token=cfg["discogs_token"], cache=run_cache)
+        if not wantlist:
+            logger.warning("Weekly Dig: could not fetch wantlist — skipping this week")
+            return
+        stats = weekly_dig.compute(wantlist, price_history, sell_history, cfg)
+        suggestions = []
+        if cfg["reissue_suggest_enabled"]:
+            problem = weekly_dig.problem_releases(stats, cfg["reissue_min_ratio"])
+            suggestions = reissue_finder.find_reissues(
+                problem, token=cfg["discogs_token"], persistent=reissue_cache, run_cache=run_cache,
+                ttl_days=cfg["reissue_cache_ttl_days"], max_lookups=cfg["reissue_max_lookups_per_run"],
+                min_supply=cfg["reissue_min_supply"], rating_min_count=cfg["rating_min_count"],
+            )
+        notifier = EmailNotifier(
+            smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],
+            smtp_user=cfg["smtp_user"], smtp_pass=cfg["smtp_pass"],
+            smtp_from=cfg["smtp_from"], smtp_to=cfg["smtp_to"],
+        )
+        notifier.send_weekly_dig(stats, suggestions, now)
+        # Only stamp on a successful send, so a failure retries next hour (still in
+        # the Sunday window) rather than skipping the week.
+        store.set_meta("weekly_dig_sent_at", now.isoformat())
+    except Exception as exc:
+        logger.error("Weekly Dig failed (%s) — continuing; hourly run unaffected", exc)
+
+
 # ── CLI ──────────────────────────────────────────────────────────────────────
 
 def _parse_args(argv=None) -> argparse.Namespace:
@@ -571,6 +650,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     policy_cache: dict = store.load_shipping_policies()
     sell_history_cache: dict = store.load_sell_history()
     price_history: dict = store.load_price_history()
+    reissue_cache: dict = store.load_reissue_cache()
 
     # ── Fetch listings ────────────────────────────────────────────────────────
     # listed_after=None paginates to completion so price drops on older
@@ -757,6 +837,11 @@ def main(args: argparse.Namespace | None = None) -> None:
         scan_counts=scan_counts,
     )
 
+    # ── Weekly Dig (isolated, best-effort; never blocks the hourly run) ───────
+    # Runs before the price-history prune so it reads the full observation window.
+    _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history_cache,
+                           reissue_cache, discogs_cache)
+
     # ── Persist + heartbeat ──────────────────────────────────────────────────
     if fetch_result.complete:
         store.set_meta("last_successful_run", now.isoformat())
@@ -773,6 +858,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     store.save_shipping_policies(policy_cache)
     store.save_sell_history(sell_history_cache)
     store.save_price_history(price_history)
+    store.save_reissue_cache(reissue_cache)
     store.set_meta("last_run", now.isoformat())
 
     logger.info(

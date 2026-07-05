@@ -52,6 +52,13 @@ CREATE TABLE IF NOT EXISTS pending_deals (
     seq  INTEGER PRIMARY KEY AUTOINCREMENT,
     deal TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS reissue_cache (
+    release_id TEXT PRIMARY KEY,
+    fetched_at TEXT,
+    conclusion TEXT,
+    artist     TEXT,
+    title      TEXT
+);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT
@@ -245,6 +252,32 @@ class Store:
             "INSERT OR REPLACE INTO price_history"
             "(release_id, condition, day, price, currency) VALUES (?, ?, ?, ?, ?)",
             rows,
+        )
+        self.conn.commit()
+
+    # ── reissue_cache: {str(rid): {"fetched_at","conclusion","artist","title"}} ──
+    # The Weekly Dig's swap-suggestion memory. Persists EVERY conclusion, including
+    # "no better pressing exists" (conclusion.suggestion is None), so a settled
+    # release is never re-queried against Discogs until its TTL lapses.
+    def load_reissue_cache(self) -> dict:
+        return {
+            r[0]: {"fetched_at": r[1],
+                   "conclusion": json.loads(r[2]) if r[2] is not None else None,
+                   "artist": r[3], "title": r[4]}
+            for r in self.conn.execute(
+                "SELECT release_id, fetched_at, conclusion, artist, title FROM reissue_cache")
+        }
+
+    def save_reissue_cache(self, cache: dict) -> None:
+        self.conn.execute("DELETE FROM reissue_cache")
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO reissue_cache"
+            "(release_id, fetched_at, conclusion, artist, title) VALUES (?, ?, ?, ?, ?)",
+            [
+                (str(rid), ent.get("fetched_at"), json.dumps(ent.get("conclusion")),
+                 ent.get("artist"), ent.get("title"))
+                for rid, ent in (cache or {}).items()
+            ],
         )
         self.conn.commit()
 
