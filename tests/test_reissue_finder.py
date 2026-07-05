@@ -55,3 +55,64 @@ def test_find_reissues_reuses_fresh_negative_conclusion_without_network():
         token="unused", persistent=persistent, run_cache={},
         ttl_days=60, max_lookups=8, min_supply=12, rating_min_count=15)
     assert out == []   # cached negative → nothing suggested, nothing fetched
+
+
+# ── adoption flag + album dedupe ──────────────────────────────────────────────
+
+def _pos(rid, sug_id, nfs, artist="The Chemical Brothers", title="Further"):
+    return {str(rid): {"fetched_at": "2026-07-05T00:00:00+00:00",
+                       "conclusion": {"suggestion": {"id": sug_id, "num_for_sale": nfs}, "raw": None},
+                       "artist": artist, "title": title}}
+
+
+def test_already_added_flag_set_when_suggested_id_on_wantlist():
+    out = reissue_finder.find_reissues(
+        [{"release_id": 1, "artist": "A", "title": "T"}],
+        token="x", persistent=_pos(1, 999, 30, "A", "T"), run_cache={},
+        ttl_days=60, max_lookups=8, min_supply=12, rating_min_count=15,
+        wantlist_ids={999})
+    assert out[0]["already_added"] is True
+
+
+def test_already_added_flag_false_when_absent():
+    out = reissue_finder.find_reissues(
+        [{"release_id": 1, "artist": "A", "title": "T"}],
+        token="x", persistent=_pos(1, 999, 30, "A", "T"), run_cache={},
+        ttl_days=60, max_lookups=8, min_supply=12, rating_min_count=15,
+        wantlist_ids={55555})
+    assert out[0]["already_added"] is False
+
+
+def test_dedupe_prefers_adopted_over_more_available():
+    subs = [
+        {"artist": "CB", "title": "Further", "already_added": False, "suggestion": {"id": 1, "num_for_sale": 78}},
+        {"artist": "CB", "title": "Further", "already_added": True, "suggestion": {"id": 2, "num_for_sale": 31}},
+    ]
+    out = reissue_finder._dedupe_by_album(subs)
+    assert len(out) == 1 and out[0]["suggestion"]["id"] == 2 and out[0]["already_added"] is True
+
+
+def test_dedupe_keeps_most_available_when_none_adopted():
+    subs = [
+        {"artist": "CB", "title": "Further", "already_added": False, "suggestion": {"id": 1, "num_for_sale": 31}},
+        {"artist": "CB", "title": "Further", "already_added": False, "suggestion": {"id": 2, "num_for_sale": 78}},
+    ]
+    out = reissue_finder._dedupe_by_album(subs)
+    assert len(out) == 1 and out[0]["suggestion"]["id"] == 2
+
+
+def test_find_reissues_reproduces_and_fixes_duplicate_further(monkeypatch):
+    """Marco's bug: two 'Further' pressings on the wantlist (original + the added
+    reissue) each generated a swap → duplicate rows, one pitching a swap AWAY from
+    the good copy. Now: one row, acknowledged as already on the wantlist."""
+    persistent = {**_pos(9648055, 9273628, 78), **_pos(9273628, 2316042, 31)}
+    problem = [
+        {"release_id": 9648055, "artist": "The Chemical Brothers", "title": "Further"},
+        {"release_id": 9273628, "artist": "The Chemical Brothers", "title": "Further"},
+    ]
+    out = reissue_finder.find_reissues(
+        problem, token="x", persistent=persistent, run_cache={},
+        ttl_days=60, max_lookups=8, min_supply=12, rating_min_count=15,
+        wantlist_ids={9648055, 9273628})   # Marco added 9273628
+    assert len(out) == 1
+    assert out[0]["suggestion"]["id"] == 9273628 and out[0]["already_added"] is True

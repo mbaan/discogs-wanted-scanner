@@ -592,10 +592,12 @@ def _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history, reissue
         suggestions = []
         if cfg["reissue_suggest_enabled"]:
             problem = weekly_dig.problem_releases(stats, cfg["reissue_min_ratio"])
+            wantlist_ids = {int(w["release_id"]) for w in wantlist if w.get("release_id")}
             suggestions = reissue_finder.find_reissues(
                 problem, token=cfg["discogs_token"], persistent=reissue_cache, run_cache=run_cache,
                 ttl_days=cfg["reissue_cache_ttl_days"], max_lookups=cfg["reissue_max_lookups_per_run"],
                 min_supply=cfg["reissue_min_supply"], rating_min_count=cfg["rating_min_count"],
+                wantlist_ids=wantlist_ids,
             )
         notifier = EmailNotifier(
             smtp_host=cfg["smtp_host"], smtp_port=cfg["smtp_port"],

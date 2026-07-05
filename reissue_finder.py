@@ -86,6 +86,28 @@ def _pick_best(details: list[dict], min_supply: int, rating_min_count: int) -> d
     return best
 
 
+def _dedupe_by_album(suggestions: list[dict]) -> list[dict]:
+    """At most one swap row per album (same artist + title). When several pressings
+    of one album are on the wantlist they each generate a suggestion — collapse them:
+    prefer a pressing you've ALREADY added (acknowledge the album's covered rather
+    than re-pitch a different copy), else keep the most-available. First-seen order
+    is preserved."""
+    groups: dict[tuple, list[dict]] = {}
+    order: list[tuple] = []
+    for s in suggestions:
+        key = ((s.get("artist") or "").strip().lower(), (s.get("title") or "").strip().lower())
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(s)
+    out = []
+    for key in order:
+        grp = groups[key]
+        pool = [s for s in grp if s.get("already_added")] or grp
+        out.append(max(pool, key=lambda s: s["suggestion"].get("num_for_sale") or 0))
+    return out
+
+
 # ── Network + persistent cache ───────────────────────────────────────────────
 
 def _get(url: str, token: str, run_cache: dict, label: str, params: dict | None = None):
@@ -156,14 +178,20 @@ def find_reissues(
     max_lookups: int,
     min_supply: int,
     rating_min_count: int,
+    wantlist_ids: set[int] | None = None,
 ) -> list[dict]:
     """For each problem release, return a display suggestion where a better EU
     pressing exists. Fresh cached conclusions (including negatives) are reused for
     free; only up to `max_lookups` *new* releases are queried this run — the rest
     wait for a later run, so Discogs is never hammered.
 
+    `wantlist_ids` (current wantlist release ids) flags each suggestion with
+    `already_added` — Marco adds the reissue rather than replacing the original, so
+    a suggested pressing that's now on the wantlist is acknowledged, not re-pitched.
+    Computed fresh each run (never cached — the wantlist changes).
+
     `persistent` is mutated in place ({str(rid): {'fetched_at','conclusion', ...}}).
-    Returns [{wantlisted_id, artist, title, suggestion:{...}}, ...]."""
+    Returns [{wantlisted_id, artist, title, suggestion:{...}, already_added:bool}, ...]."""
     now_iso = datetime.now(timezone.utc).isoformat()
     lookups = 0
     suggestions: list[dict] = []
@@ -186,8 +214,13 @@ def find_reissues(
             continue   # over the per-run budget — leave for a later run
         sug = (conclusion or {}).get("suggestion")
         if sug:
+            sid = sug.get("id")
+            added = bool(wantlist_ids and sid is not None and int(sid) in wantlist_ids)
             suggestions.append({"wantlisted_id": rid, "artist": item.get("artist"),
-                                "title": item.get("title"), "suggestion": sug})
+                                "title": item.get("title"), "suggestion": sug,
+                                "already_added": added})
+    deduped = _dedupe_by_album(suggestions)
     if lookups:
-        logger.info("Reissue finder: %d new lookup(s), %d suggestion(s) total", lookups, len(suggestions))
-    return suggestions
+        logger.info("Reissue finder: %d new lookup(s), %d suggestion(s) after album-dedupe",
+                    lookups, len(deduped))
+    return deduped

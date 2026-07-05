@@ -1081,22 +1081,32 @@ def _dig_drift_row(d) -> str:
             f'<strong style="color:{_OX};">+{d.pct}%</strong></td></tr>')
 
 
+_MOSS = "#4e7a3a"   # muted success green for the "already on your wantlist" tick
+
+
 def _dig_suggestion(sug) -> str:
     s = sug["suggestion"]
+    added = sug.get("already_added")
     low = s.get("lowest_price")
     low_s = _money(low, "EUR") if isinstance(low, (int, float)) else "—"
     rating = s.get("rating_avg")
     rating_s = f'{rating}/5 ({s.get("rating_count")})' if rating else "unrated"
+    url = f'https://www.discogs.com/release/{s["id"]}'
+    id_link = f'<a href="{url}" style="color:{_OX}; text-decoration:none;">release {s["id"]}</a>'
+    # Adopted → acknowledge (don't tell Marco to add what he's already added); still
+    # show the availability so he sees the copy is out there and cheap.
+    lead = (f'<strong style="color:{_MOSS};">✓ already on your wantlist</strong> · {id_link}'
+            if added else f'→ wantlist {id_link}')
     warn = ""
     if s.get("low_rating"):
+        tail = "worth double-checking the pressing" if added else "worth checking why before you wantlist it"
         warn = (f'<div style="font-family:{_COND}; font-size:12px; color:{_OX}; margin-top:4px;">'
-                f'⚠ mixed reviews ({rating_s}) — worth checking why before you wantlist it</div>')
-    url = f'https://www.discogs.com/release/{s["id"]}'
+                f'⚠ mixed reviews ({rating_s}) — {tail}</div>')
     return (f'<div style="padding:10px 0; border-bottom:1px solid {_HAIR};">'
             f'<div style="font-family:{_SERIF}; font-size:14px; color:{_INK};">'
             f'{_dig_ident(sug.get("artist"), sug.get("title"))}</div>'
             f'<div style="font-family:{_COND}; font-size:13px; color:{_MUTED}; margin-top:4px;">'
-            f'→ wantlist <a href="{url}" style="color:{_OX}; text-decoration:none;">release {s["id"]}</a> '
+            f'{lead} '
             f'· {_h(str(s.get("country") or ""))} {_h(str(s.get("year") or ""))} '
             f'· <strong style="color:{_INK};">{s.get("num_for_sale")} for sale</strong> '
             f'· from {low_s} · rating {rating_s}</div>{warn}</div>')
@@ -1161,7 +1171,9 @@ def _build_dig_html(stats, suggestions, run_time: datetime, session_days_left: i
             + f'<table role="presentation" width="100%" cellpadding="0" cellspacing="0">{rows}</table>{note}'))
 
     if suggestions:
-        body = "".join(_dig_suggestion(s) for s in suggestions)
+        # Still-actionable swaps first; ones you've already added drop to the bottom.
+        ordered = sorted(suggestions, key=lambda x: x.get("already_added", False))
+        body = "".join(_dig_suggestion(s) for s in ordered)
         cards.append(_dig_card(
             _dig_section_title("Swap for a copy you can actually get")
             + '<div style="font-family:' + _COND + '; font-size:12px; color:' + _MUTED
@@ -1224,15 +1236,16 @@ def _build_dig_text(stats, suggestions, run_time: datetime) -> str:
         lines.append("")
     if suggestions:
         lines.append("SWAP FOR A COPY YOU CAN ACTUALLY GET:")
-        for sug in suggestions:
+        for sug in sorted(suggestions, key=lambda x: x.get("already_added", False)):
             s = sug["suggestion"]
             ident = (f"{sug.get('artist')} - " if sug.get("artist") else "") + (sug.get("title") or "?")
             low = s.get("lowest_price")
             low_s = _money(low, "EUR") if isinstance(low, (int, float)) else "-"
             rating = s.get("rating_avg")
             rating_s = f"{rating}/5 ({s.get('rating_count')})" if rating else "unrated"
+            prefix = "[on your wantlist already] " if sug.get("already_added") else "-> "
             lines.append(f"  {ident}")
-            lines.append(f"    -> release {s['id']} · {s.get('country') or ''} {s.get('year') or ''} · "
+            lines.append(f"    {prefix}release {s['id']} · {s.get('country') or ''} {s.get('year') or ''} · "
                          f"{s.get('num_for_sale')} for sale · from {low_s} · rating {rating_s}"
                          + ("  [!] mixed reviews — check first" if s.get("low_rating") else ""))
         lines.append("")
