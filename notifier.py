@@ -1030,7 +1030,7 @@ _DIG_MAX_DRIFT = 12
 def _build_dig_subject(stats, suggestions) -> str:
     s = "s" if len(suggestions) != 1 else ""
     return (f"[Discogs Watcher] ⛏ The Weekly Dig — {stats.seen_count} watched, "
-            f"{len(stats.seen_never_deal)} never a deal, {len(suggestions)} swap{s}")
+            f"{len(stats.seen_never_deal)} never a deal, {len(suggestions)} alt pressing{s}")
 
 
 def _dig_card(inner: str) -> str:
@@ -1175,7 +1175,7 @@ def _build_dig_html(stats, suggestions, run_time: datetime, session_days_left: i
         ordered = sorted(suggestions, key=lambda x: x.get("already_added", False))
         body = "".join(_dig_suggestion(s) for s in ordered)
         cards.append(_dig_card(
-            _dig_section_title("Swap for a copy you can actually get")
+            _dig_section_title("A copy you can actually get")
             + '<div style="font-family:' + _COND + '; font-size:12px; color:' + _MUTED
             + '; margin:-4px 0 8px;">Same album, a more-available EU pressing:</div>' + body))
 
@@ -1235,7 +1235,7 @@ def _build_dig_text(stats, suggestions, run_time: datetime) -> str:
             lines.append(f"  +{extra} more")
         lines.append("")
     if suggestions:
-        lines.append("SWAP FOR A COPY YOU CAN ACTUALLY GET:")
+        lines.append("A COPY YOU CAN ACTUALLY GET:")
         for sug in sorted(suggestions, key=lambda x: x.get("already_added", False)):
             s = sug["suggestion"]
             ident = (f"{sug.get('artist')} - " if sug.get("artist") else "") + (sug.get("title") or "?")
