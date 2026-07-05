@@ -494,3 +494,52 @@ def test_main_full_run_emails_and_pushes(monkeypatch, tmp_path):
     )
     assert len(calls) == 1                       # push re-fires despite prior push
     assert digest_sends == [1]                   # digest email sent (not suppressed)
+
+
+# ── --dig manual trigger: force bypasses the schedule + enabled flag ──────────
+
+def _dig_cfg():
+    return {
+        "weekly_dig_enabled": False,        # OFF — a forced run must still send
+        "weekly_dig_dow": 6, "weekly_dig_hour_utc": 18,
+        "discogs_token": "t", "discogs_username": "u",
+        "reissue_suggest_enabled": False,
+        "sold_price_min_points": 5, "shipping_allowance": 7.0,
+        "dig_recent_days": 45, "dig_drift_min_pct": 0.20,
+        "smtp_host": "h", "smtp_port": 25, "smtp_user": "u", "smtp_pass": "p",
+        "smtp_from": "f@x", "smtp_to": "t@x",
+    }
+
+
+def _stub_dig(monkeypatch, sent):
+    class FakeNotifier:
+        def __init__(self, **kw):
+            pass
+
+        def send_weekly_dig(self, stats, suggestions, now, **kw):
+            sent["stats"] = stats
+
+    monkeypatch.setattr(watcher, "EmailNotifier", FakeNotifier)
+    monkeypatch.setattr(watcher.discogs_api, "wantlist_releases",
+                        lambda *a, **k: [{"release_id": 1, "artist": "A", "title": "T", "year": 2000}])
+
+
+# A Wednesday, well outside the Sunday-evening send window.
+_WED = datetime(2026, 7, 1, 12, 0, tzinfo=timezone.utc)
+
+
+def test_dig_force_sends_when_disabled_and_off_schedule(monkeypatch):
+    sent = {}
+    _stub_dig(monkeypatch, sent)
+    store = Store.open(":memory:")
+    watcher._maybe_send_weekly_dig(store, _dig_cfg(), _WED, {}, {}, {}, {}, force=True)
+    assert "stats" in sent                                   # sent despite off + wrong day
+    assert store.get_meta("weekly_dig_sent_at") is None      # must NOT consume the weekly slot
+
+
+def test_dig_not_sent_when_disabled_and_not_forced(monkeypatch):
+    sent = {}
+    _stub_dig(monkeypatch, sent)
+    store = Store.open(":memory:")
+    watcher._maybe_send_weekly_dig(store, _dig_cfg(), _WED, {}, {}, {}, {}, force=False)
+    assert "stats" not in sent

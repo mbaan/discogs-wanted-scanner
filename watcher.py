@@ -310,27 +310,27 @@ def _load_config() -> dict:
                            cfg["push_channel"])
             cfg["push_enabled"] = False
 
-    # ── Weekly Dig: silent sensible defaults when the feature is on, same pattern
-    # as the sold-price knobs (Pi runs without forcing .env edits on deploy). ──
-    if cfg["weekly_dig_enabled"]:
-        if cfg["weekly_dig_dow"] is None:
-            cfg["weekly_dig_dow"] = 6       # Sunday (Mon=0 … Sun=6)
-        if cfg["weekly_dig_hour_utc"] is None:
-            cfg["weekly_dig_hour_utc"] = 18  # ≈ 20:00 CEST — Sunday evening
-        if cfg["reissue_cache_ttl_days"] is None:
-            cfg["reissue_cache_ttl_days"] = 60
-        if cfg["reissue_max_lookups_per_run"] is None:
-            cfg["reissue_max_lookups_per_run"] = 8
-        if cfg["reissue_min_ratio"] is None:
-            cfg["reissue_min_ratio"] = 1.8
-        if cfg["reissue_min_supply"] is None:
-            cfg["reissue_min_supply"] = 12
-        if cfg["rating_min_count"] is None:
-            cfg["rating_min_count"] = 15
-        if cfg["dig_recent_days"] is None:
-            cfg["dig_recent_days"] = 45
-        if cfg["dig_drift_min_pct"] is None:
-            cfg["dig_drift_min_pct"] = 0.20
+    # ── Weekly Dig: silent sensible defaults. Applied unconditionally (not gated on
+    # WEEKLY_DIG_ENABLED) so a manual `--dig` force-run works even before the weekly
+    # schedule is switched on. Harmless when off: only the Dig path reads them. ──
+    if cfg["weekly_dig_dow"] is None:
+        cfg["weekly_dig_dow"] = 6            # Sunday (Mon=0 … Sun=6)
+    if cfg["weekly_dig_hour_utc"] is None:
+        cfg["weekly_dig_hour_utc"] = 18      # ≈ 20:00 CEST — Sunday evening
+    if cfg["reissue_cache_ttl_days"] is None:
+        cfg["reissue_cache_ttl_days"] = 60
+    if cfg["reissue_max_lookups_per_run"] is None:
+        cfg["reissue_max_lookups_per_run"] = 8
+    if cfg["reissue_min_ratio"] is None:
+        cfg["reissue_min_ratio"] = 1.8
+    if cfg["reissue_min_supply"] is None:
+        cfg["reissue_min_supply"] = 12
+    if cfg["rating_min_count"] is None:
+        cfg["rating_min_count"] = 15
+    if cfg["dig_recent_days"] is None:
+        cfg["dig_recent_days"] = 45
+    if cfg["dig_drift_min_pct"] is None:
+        cfg["dig_drift_min_pct"] = 0.20
 
     if missing:
         logger.error(
@@ -562,19 +562,25 @@ def _report_path():
 
 # ── The Weekly Dig ─────────────────────────────────────────────────────────────
 
-def _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history, reissue_cache, run_cache) -> None:
+def _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history, reissue_cache,
+                           run_cache, force=False) -> None:
     """Send the weekly status Dig if its window is open and a week has passed.
     Best-effort and fully isolated: any failure logs and is swallowed so a Dig
     problem can never disturb the hourly deal run. `reissue_cache` is mutated in
     place (new conclusions) and persisted by the caller regardless of send outcome,
-    so lookups already spent aren't repeated even if the email itself fails."""
-    if not cfg["weekly_dig_enabled"]:
+    so lookups already spent aren't repeated even if the email itself fails.
+
+    `force` (--dig) bypasses the enabled flag AND the schedule/dedup gate to send
+    now, and deliberately does NOT stamp `weekly_dig_sent_at`, so a manual preview
+    can't suppress the real scheduled Sunday send."""
+    if not force and not cfg["weekly_dig_enabled"]:
         return
-    if not weekly_dig.should_send(now, cfg["weekly_dig_dow"], cfg["weekly_dig_hour_utc"],
-                                  store.get_meta("weekly_dig_sent_at")):
+    if not force and not weekly_dig.should_send(
+            now, cfg["weekly_dig_dow"], cfg["weekly_dig_hour_utc"],
+            store.get_meta("weekly_dig_sent_at")):
         return
     if not (cfg["discogs_token"] and cfg["discogs_username"]):
-        logger.warning("Weekly Dig due but DISCOGS_TOKEN/DISCOGS_USERNAME unset — skipping")
+        logger.warning("Weekly Dig requested but DISCOGS_TOKEN/DISCOGS_USERNAME unset — skipping")
         return
     try:
         wantlist = discogs_api.wantlist_releases(
@@ -597,9 +603,12 @@ def _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history, reissue
             smtp_from=cfg["smtp_from"], smtp_to=cfg["smtp_to"],
         )
         notifier.send_weekly_dig(stats, suggestions, now)
-        # Only stamp on a successful send, so a failure retries next hour (still in
-        # the Sunday window) rather than skipping the week.
-        store.set_meta("weekly_dig_sent_at", now.isoformat())
+        if force:
+            logger.info("Weekly Dig force-sent (--dig) — schedule + dedup untouched")
+        else:
+            # Only stamp on a successful scheduled send, so a failure retries next
+            # hour (still in the Sunday window) rather than skipping the week.
+            store.set_meta("weekly_dig_sent_at", now.isoformat())
     except Exception as exc:
         logger.error("Weekly Dig failed (%s) — continuing; hourly run unaffected", exc)
 
@@ -615,6 +624,12 @@ def _parse_args(argv=None) -> argparse.Namespace:
         "--full", action="store_true",
         help="Loud full run: re-surface every current deal, force-refresh sold "
              "prices, and email + push the lot (capped by the usual limits)",
+    )
+    parser.add_argument(
+        "--dig", action="store_true",
+        help="Force-send The Weekly Dig now, ignoring its weekly schedule + dedup "
+             "(does NOT consume the scheduled Sunday send). Needs DISCOGS_TOKEN + "
+             "DISCOGS_USERNAME; works even if WEEKLY_DIG_ENABLED is off.",
     )
     return parser.parse_args(argv)
 
@@ -849,7 +864,7 @@ def main(args: argparse.Namespace | None = None) -> None:
     # ── Weekly Dig (isolated, best-effort; never blocks the hourly run) ───────
     # Runs before the price-history prune so it reads the full observation window.
     _maybe_send_weekly_dig(store, cfg, now, price_history, sell_history_cache,
-                           reissue_cache, discogs_cache)
+                           reissue_cache, discogs_cache, force=args.dig)
 
     # ── Persist + heartbeat ──────────────────────────────────────────────────
     if fetch_result.complete:
