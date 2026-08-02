@@ -45,7 +45,14 @@ def _load_cookies(cookies_path: Path) -> dict:
         )
     with open(cookies_path) as f:
         data = json.load(f)
-    return {k: v for k, v in data.items() if not k.startswith("_")}
+    # Drop _-prefixed metadata (_comment, _expires) AND cf_clearance. The latter
+    # is an IP+UA-bound Cloudflare challenge token with a short TTL: replaying a
+    # stale or foreign-IP one (e.g. exported from a desktop browser but run from
+    # the Pi) actively raises the managed-challenge odds — the same reason
+    # __cf_bm is dropped. _warm_up mints a fresh, correctly-bound cf_clearance
+    # in-session each run instead.
+    return {k: v for k, v in data.items()
+            if not k.startswith("_") and k != "cf_clearance"}
 
 
 def session_expires_at(cookies: dict) -> datetime | None:

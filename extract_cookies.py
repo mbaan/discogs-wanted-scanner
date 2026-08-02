@@ -7,9 +7,13 @@ writes cookies.json next to this script:
 
     python extract_cookies.py
 
-It keeps only the cookies that matter: sid + session authenticate; cf_clearance
-(if present) helps past Cloudflare. An existing cookies.json is replaced only
-after you confirm (or backed up to cookies.json.bak when run non-interactively).
+It keeps only the cookies that matter: sid + session authenticate. An existing
+cookies.json is replaced only after you confirm (or backed up to cookies.json.bak
+when run non-interactively).
+
+cf_clearance is intentionally NOT captured: it's an IP+UA-bound Cloudflare
+challenge token, so a copy exported from your browser is wrong for the Pi that
+runs the watcher. shop_api._warm_up mints a fresh, correctly-bound one per run.
 """
 import json
 import sys
@@ -17,9 +21,10 @@ from pathlib import Path
 
 _COOKIES_FILE = Path(__file__).parent / "cookies.json"
 
-# __cf_bm is intentionally omitted — shop_api._load_cookies drops _-prefixed
-# keys, so it would never reach the request anyway.
-_WANTED = ("sid", "session", "cf_clearance")
+# __cf_bm and cf_clearance are intentionally omitted — shop_api._load_cookies
+# drops both (Cloudflare tokens are minted fresh per run by _warm_up), so they
+# would never reach the request anyway.
+_WANTED = ("sid", "session")
 
 
 def parse_cookie_string(raw: str) -> dict:
@@ -81,8 +86,9 @@ def main() -> None:
         sys.exit("Left cookies.json unchanged.")
 
     payload = {
-        "_comment": "sid + session authenticate to Discogs; cf_clearance helps past "
-                    "Cloudflare. Written by extract_cookies.py.",
+        "_comment": "sid + session authenticate to Discogs. Cloudflare tokens "
+                    "(cf_clearance, __cf_bm) are minted fresh per run, not stored. "
+                    "Written by extract_cookies.py.",
         **cookies,
     }
     _COOKIES_FILE.write_text(json.dumps(payload, indent=2) + "\n")

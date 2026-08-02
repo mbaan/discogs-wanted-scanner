@@ -101,3 +101,21 @@ def test_session_expiry_handles_missing():
     assert shop_api.session_expires_at({}) is None
     assert shop_api.session_expires_at({"session": "no-expires-here"}) is None
     assert shop_api.session_expires_at({"session": "tok=?_expires=garbage"}) is None
+
+
+def test_load_cookies_drops_cloudflare_tokens(tmp_path):
+    # cf_clearance is an IP+UA-bound Cloudflare challenge token with a short TTL.
+    # Replaying a stale or foreign-IP one (e.g. exported from a desktop browser
+    # but run from the Pi) raises the managed-challenge odds, so it must NOT be
+    # loaded from disk — the per-run _warm_up mints a fresh, correctly-bound one,
+    # exactly as __cf_bm is already handled. Only sid + session persist.
+    path = tmp_path / "cookies.json"
+    path.write_text(json.dumps({
+        "_comment": "metadata, dropped",
+        "sid": "SID",
+        "session": "SESS",
+        "cf_clearance": "stale-desktop-token",
+        "__cf_bm": "stale-bot-cookie",
+    }))
+    loaded = shop_api._load_cookies(path)
+    assert loaded == {"sid": "SID", "session": "SESS"}
